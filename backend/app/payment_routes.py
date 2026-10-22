@@ -1,4 +1,4 @@
-﻿from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -13,6 +13,8 @@ from app.database import get_db
 from app.user_models import User
 
 router = APIRouter(prefix="/api/payments", tags=["Sandbox Payments"])
+
+PAYMENT_TIMEOUT_MINUTES = 10
 
 
 class SandboxPaymentRequest(BaseModel):
@@ -55,6 +57,16 @@ def simulate_payment(
             detail="Booking is not awaiting payment",
         )
 
+    cutoff = datetime.now(timezone.utc) - timedelta(
+        minutes=PAYMENT_TIMEOUT_MINUTES
+    )
+    if booking.booked_at <= cutoff:
+        booking.status = "cancelled"
+        db.commit()
+        raise HTTPException(
+            status_code=409,
+            detail="Payment window expired; booking was cancelled. Please select the seat again.",
+        )
     showtime = db.get(Showtime, booking.showtime_id)
     if showtime is None:
         raise HTTPException(status_code=404, detail="Showtime not found")
