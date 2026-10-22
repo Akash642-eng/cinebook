@@ -1,0 +1,49 @@
+﻿# Secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Node
+node_modules/
+dist/
+npm-debug.log*
+
+# Editors and operating systems
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Terraform
+terraform/.terraform/
+terraform/*.tfstate
+terraform/*.tfstate.*
+terraform/*.tfvars
+!terraform/*.tfvars.example
+terraform/crash.log
+
+# Test output
+test-results/
+playwright-report/
+# Local backups and database dumps
+backups/
+*.sql
+*.backup
+docker-compose.yml.*backup*
+
+# Temporary source backups
+*.day1-backup
+*.day2-backup
+*.before-timeout
+*.before-day4
