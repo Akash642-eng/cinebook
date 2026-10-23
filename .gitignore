@@ -47,3 +47,6 @@ docker-compose.yml.*backup*
 *.day2-backup
 *.before-timeout
 *.before-day4
+
+# Track application database migrations
+!backend/migrations/*.sql

@@ -1,4 +1,4 @@
-﻿import { useEffect, useState, type FormEvent } from "react";
+import { useEffect, useState, type FormEvent } from "react";
 import "./App.css";
 
 type Movie = {
@@ -60,8 +60,19 @@ type Booking = {
   user_id: number;
   showtime_id: number;
   seat_number: number;
-  status: "confirmed" | "cancelled";
+  status: "pending_payment" | "confirmed" | "cancelled";
   booked_at: string;
+};
+
+type SandboxPaymentResponse = {
+  id: number;
+  booking_id: number;
+  amount_rupees: string;
+  currency: string;
+  provider: string;
+  status: "succeeded" | "failed";
+  reference: string;
+  created_at: string;
 };
 
 type AuthMode = "login" | "register";
@@ -119,7 +130,7 @@ function App() {
     () => sessionStorage.getItem(TOKEN_KEY) ?? "",
   );
   const [user, setUser] = useState<User | null>(null);
-  const [authLoading, setAuthLoading] = useState(true);
+  const [authLoading, setAuthLoading] = useState(() => Boolean(sessionStorage.getItem(TOKEN_KEY)));
   const [authMode, setAuthMode] = useState<AuthMode>("login");
   const [showAuth, setShowAuth] = useState(false);
   const [fullName, setFullName] = useState("");
@@ -143,6 +154,9 @@ function App() {
   const [seatsBusy, setSeatsBusy] = useState(false);
   const [selectedSeat, setSelectedSeat] = useState<number | null>(null);
   const [bookingBusy, setBookingBusy] = useState(false);
+  const [pendingPaymentBooking, setPendingPaymentBooking] = useState<Booking | null>(null);
+  const [paymentBusy, setPaymentBusy] = useState(false);
+  const [paymentResult, setPaymentResult] = useState<SandboxPaymentResponse | null>(null);
 
   const [bookings, setBookings] = useState<Booking[]>([]);
   const [bookingsBusy, setBookingsBusy] = useState(false);
@@ -178,12 +192,8 @@ function App() {
     let active = true;
 
     if (!token) {
-      setUser(null);
-      setAuthLoading(false);
       return;
     }
-
-    setAuthLoading(true);
 
     apiRequest<User>("/api/auth/me", { method: "GET" }, token)
       .then((profile) => {
@@ -348,9 +358,10 @@ function App() {
 
     setBookingBusy(true);
     setNotice("");
+    setPaymentResult(null);
 
     try {
-      await apiRequest<Booking>(
+      const booking = await apiRequest<Booking>(
         "/api/bookings",
         {
           method: "POST",
@@ -362,17 +373,17 @@ function App() {
         token,
       );
 
-      setNotice(`Seat ${selectedSeat} booked successfully!`);
-      setSelectedSeat(null);
+      setPendingPaymentBooking(booking);
+      setNotice(
+        `Booking #${booking.id} is reserved for payment. Complete sandbox checkout within 10 minutes.`,
+      );
 
       const refreshed = await apiRequest<SeatAvailability>(
         `/api/showtimes/${selectedShowtime.id}/seats`,
       );
       setSeatData(refreshed);
-
-      if (showBookings) await loadMyBookings();
     } catch (error) {
-      setNotice(error instanceof Error ? error.message : "Booking failed.");
+      setNotice(error instanceof Error ? error.message : "Could not create booking.");
       try {
         const refreshed = await apiRequest<SeatAvailability>(
           `/api/showtimes/${selectedShowtime.id}/seats`,
@@ -386,6 +397,64 @@ function App() {
     }
   }
 
+  async function simulatePayment(outcome: "success" | "failure") {
+    if (!token || !pendingPaymentBooking || paymentBusy) return;
+
+    setPaymentBusy(true);
+    setNotice("");
+    setPaymentResult(null);
+
+    try {
+      const result = await apiRequest<SandboxPaymentResponse>(
+        "/api/payments/sandbox",
+        {
+          method: "POST",
+          body: JSON.stringify({
+            booking_id: pendingPaymentBooking.id,
+            outcome,
+          }),
+        },
+        token,
+      );
+
+      setPaymentResult(result);
+      setPendingPaymentBooking(null);
+      setSelectedSeat(null);
+      setNotice(
+        result.status === "succeeded"
+          ? `Payment successful. Booking #${result.booking_id} is confirmed.`
+          : `Sandbox payment failed. Booking #${result.booking_id} was cancelled.`,
+      );
+
+      if (selectedShowtime) {
+        const refreshed = await apiRequest<SeatAvailability>(
+          `/api/showtimes/${selectedShowtime.id}/seats`,
+        );
+        setSeatData(refreshed);
+      }
+
+      if (showBookings) await loadMyBookings();
+    } catch (error) {
+      setNotice(
+        error instanceof Error
+          ? error.message
+          : "Payment could not be completed. Check booking status before retrying.",
+      );
+
+      if (selectedShowtime) {
+        try {
+          const refreshed = await apiRequest<SeatAvailability>(
+            `/api/showtimes/${selectedShowtime.id}/seats`,
+          );
+          setSeatData(refreshed);
+        } catch {
+          // Keep the original payment error.
+        }
+      }
+    } finally {
+      setPaymentBusy(false);
+    }
+  }
   async function loadMyBookings() {
     if (!token) return;
 
@@ -457,7 +526,7 @@ function App() {
 
         <div className="account-actions">
           {authLoading ? (
-            <span className="account-label">Checking session…</span>
+            <span className="account-label">Checking session...</span>
           ) : user ? (
             <>
               <span className="account-label">
@@ -465,7 +534,7 @@ function App() {
                 {user.role === "admin" && <span className="role-pill">ADMIN</span>}
               </span>
               <button className="signin-button" onClick={logout}>
-                Sign out <span aria-hidden="true">↗</span>
+                Sign out <span aria-hidden="true">&gt;</span>
               </button>
             </>
           ) : (
@@ -478,7 +547,7 @@ function App() {
                 setShowAuth(true);
               }}
             >
-              Sign in <span aria-hidden="true">↗</span>
+              Sign in <span aria-hidden="true">&gt;</span>
             </button>
           )}
         </div>
@@ -545,8 +614,8 @@ function App() {
                 </label>
 
                 <button className="primary-button auth-submit" disabled={authBusy}>
-                  {authBusy ? "Please wait…" : authMode === "login" ? "Sign in" : "Create account"}
-                  <span aria-hidden="true">→</span>
+                  {authBusy ? "Please wait..." : authMode === "login" ? "Sign in" : "Create account"}
+                  <span aria-hidden="true">&gt;</span>
                 </button>
               </form>
 
@@ -585,11 +654,11 @@ function App() {
           <section className="admin-section" aria-labelledby="admin-title">
             <div className="section-heading">
               <div>
-                <div className="eyebrow">RESTRICTED AREA · ADMINISTRATOR</div>
+                <div className="eyebrow">RESTRICTED AREA | ADMINISTRATOR</div>
                 <h2 id="admin-title">Admin dashboard<span>.</span></h2>
               </div>
               <button className="book-button" onClick={loadAdminDashboard} disabled={dashboardBusy}>
-                {dashboardBusy ? "Loading…" : "Refresh statistics"}
+                {dashboardBusy ? "Loading..." : "Refresh statistics"}
               </button>
             </div>
 
@@ -616,7 +685,7 @@ function App() {
             )}
 
             {!dashboard && !dashboardError && !dashboardBusy && (
-              <p className="auth-description">Select “Refresh statistics” to load live data from the backend.</p>
+              <p className="auth-description">Select Refresh statistics to load the latest dashboard figures.</p>
             )}
           </section>
         )}
@@ -632,8 +701,7 @@ function App() {
                 Close
               </button>
             </div>
-
-            {bookingsBusy && <p className="auth-description">Loading your bookings…</p>}
+            {bookingsBusy && <p className="auth-description">Loading your bookings...</p>}
             {bookingsError && <div className="state-message error-message">{bookingsError}</div>}
 
             {!bookingsBusy && !bookingsError && bookings.length === 0 && (
@@ -647,7 +715,7 @@ function App() {
                   <article className="history-card" key={booking.id}>
                     <div>
                       <strong>{showtime?.movie_title ?? `Showtime #${booking.showtime_id}`}</strong>
-                      <p>Seat {booking.seat_number} · {booking.status}</p>
+                      <p>Seat {booking.seat_number} | {booking.status}</p>
                       {showtime && <p>{formatDateTime(showtime.starts_at)}</p>}
                     </div>
                     {booking.status === "confirmed" && (
@@ -667,7 +735,7 @@ function App() {
             <div className="eyebrow"><span className="live-dot" />YOUR NEXT MOVIE NIGHT STARTS HERE</div>
             <h1>Big stories.<br /><span>Big-screen</span> moments.</h1>
             <p>Discover your next favourite film. Choose your seats. Make every movie night count.</p>
-            <a className="primary-button" href="#movies">Explore movies <span aria-hidden="true">→</span></a>
+            <a className="primary-button" href="#movies">Explore movies &gt;</a>
             <div className="hero-meta">
               <span><strong>01</strong> Discover</span>
               <span><strong>02</strong> Choose seats</span>
@@ -678,7 +746,7 @@ function App() {
           <div className="hero-art" aria-label="Decorative cinematic spotlight">
             <div className="orbit orbit-one" />
             <div className="orbit orbit-two" />
-            <div className="film-reel">C<span>✦</span></div>
+            <div className="film-reel">C<span>*</span></div>
             <div className="hero-caption">
               <span>YOUR SEAT IS WAITING</span>
               <strong>Lights. Camera. CineBook.</strong>
@@ -694,8 +762,7 @@ function App() {
             </div>
             <div className="catalogue-label"><span className="catalogue-dot" />MOVIE COLLECTION</div>
           </div>
-
-          {loadingMovies && <div className="state-message">Loading the latest movies…</div>}
+          {loadingMovies && <div className="state-message">Loading the latest movies...</div>}
           {movieError && <div className="state-message error-message">{movieError}</div>}
           {!loadingMovies && !movieError && movies.length === 0 && (
             <div className="state-message">No movies are available right now.</div>
@@ -716,7 +783,7 @@ function App() {
                   <div className="movie-footer">
                     <span>{movie.duration_minutes} min</span>
                     <button className="book-button" onClick={() => openMovieBooking(movie)}>
-                      Book tickets <span aria-hidden="true">↗</span>
+                      Book tickets <span aria-hidden="true">&gt;</span>
                     </button>
                   </div>
                 </div>
@@ -731,7 +798,7 @@ function App() {
               <div>
                 <div className="eyebrow">CHOOSE YOUR CINEMA EXPERIENCE</div>
                 <h2 id="booking-title">{selectedMovie.title}<span>.</span></h2>
-                <p className="auth-description">{selectedMovie.language} · {selectedMovie.duration_minutes} minutes</p>
+                <p className="auth-description">{selectedMovie.language} | {selectedMovie.duration_minutes} minutes</p>
               </div>
               <button
                 className="book-button"
@@ -745,8 +812,7 @@ function App() {
                 Close
               </button>
             </div>
-
-            {showtimesBusy && <div className="state-message">Finding upcoming showtimes…</div>}
+            {showtimesBusy && <div className="state-message">Finding upcoming showtimes...</div>}
             {showtimesError && <div className="state-message error-message">{showtimesError}</div>}
             {!showtimesBusy && !showtimesError && showtimes.length === 0 && (
               <div className="state-message">No upcoming showtimes are available for this movie.</div>
@@ -763,7 +829,7 @@ function App() {
                       onClick={() => chooseShowtime(showtime)}
                     >
                       <strong>{formatDateTime(showtime.starts_at)}</strong>
-                      <span>{showtime.cinema_name} · {showtime.city}</span>
+                      <span>{showtime.cinema_name} | {showtime.city}</span>
                       <span>{showtime.screen_name}</span>
                       <b>{formatPrice(showtime.ticket_price_paise)} / ticket</b>
                     </button>
@@ -776,10 +842,9 @@ function App() {
               <div className="seat-section">
                 <h3 className="booking-subtitle">2. Choose your seat</h3>
                 <p className="auth-description">
-                  {selectedShowtime.screen_name} · {seatData?.available_seats ?? "—"} seats available
+                  {selectedShowtime.screen_name} | {seatData?.available_seats ?? 0} seats available
                 </p>
-
-                {seatsBusy && <div className="state-message">Loading seat availability…</div>}
+                    {seatsBusy && <div className="state-message">Loading seat availability...</div>}
 
                 {seatData && (
                   <>
@@ -808,23 +873,73 @@ function App() {
                       <span><i className="legend-booked" /> Booked</span>
                     </div>
 
-                    <div className="booking-summary">
-                      <div>
-                        <span className="auth-description">Selected seat</span>
-                        <strong>{selectedSeat === null ? "Choose a seat" : `Seat ${selectedSeat}`}</strong>
+                    {!pendingPaymentBooking && (
+                      <div className="booking-summary">
+                        <div>
+                          <span className="auth-description">Selected seat</span>
+                          <strong>{selectedSeat === null ? "Select a seat to see the total" : formatPrice(selectedShowtime.ticket_price_paise)}</strong>
+                        </div>
+                        <div>
+                          <span className="auth-description">Total</span>
+                          <strong>{selectedSeat === null ? "Select a seat to see the total" : formatPrice(selectedShowtime.ticket_price_paise)}</strong>
+                        </div>
+                        <button
+                          className="primary-button"
+                          disabled={selectedSeat === null || bookingBusy || seatsBusy}
+                          onClick={confirmBooking}
+                        >
+                    {bookingBusy ? "Creating reservation..." : user ? "Continue to checkout" : "Sign in to book"}
+                        </button>
                       </div>
-                      <div>
-                        <span className="auth-description">Total</span>
-                        <strong>{selectedSeat === null ? "—" : formatPrice(selectedShowtime.ticket_price_paise)}</strong>
+                    )}
+
+                    {pendingPaymentBooking && (
+                      <div className="sandbox-checkout">
+                        <h3>3. Sandbox checkout</h3>
+                        <p>
+                      Booking #{pendingPaymentBooking.id} | Seat {pendingPaymentBooking.seat_number}
+                        </p>
+                        <p>
+                          Amount: <strong>{formatPrice(selectedShowtime.ticket_price_paise)}</strong>
+                        </p>
+                        <p className="auth-description">
+                          This is a simulated payment only. No real money is charged.
+                          Complete the test within 10 minutes.
+                        </p>
+                        <div className="sandbox-actions">
+                          <button
+                            className="primary-button"
+                            disabled={paymentBusy}
+                            onClick={() => simulatePayment("success")}
+                          >
+                        {paymentBusy ? "Processing..." : "Simulate Successful Payment"}
+                          </button>
+                          <button
+                            className="book-button"
+                            disabled={paymentBusy}
+                            onClick={() => simulatePayment("failure")}
+                          >
+                            Simulate Failed Payment
+                          </button>
+                        </div>
                       </div>
-                      <button
-                        className="primary-button"
-                        disabled={selectedSeat === null || bookingBusy || seatsBusy}
-                        onClick={confirmBooking}
-                      >
-                        {bookingBusy ? "Booking…" : user ? "Confirm booking" : "Sign in to book"}
-                      </button>
-                    </div>
+                    )}
+
+                    {paymentResult && (
+                      <div className="sandbox-payment-result">
+                        <h3>
+                          {paymentResult.status === "succeeded"
+                            ? "Payment successful"
+                            : "Payment failed"}
+                        </h3>
+                        <p>Payment reference: <strong>{paymentResult.reference}</strong></p>
+                        <p>
+                          Amount: {paymentResult.currency} {paymentResult.amount_rupees}
+                        </p>
+                        <p>Booking ID: {paymentResult.booking_id}</p>
+                        <p>Status: {paymentResult.status}</p>
+                      </div>
+                    )}
                     {user?.role === "admin" && (
                       <p className="auth-description">Administrator accounts cannot book customer tickets.</p>
                     )}
@@ -837,15 +952,15 @@ function App() {
 
         <section className="experience-strip" id="experience">
           <div>
-            <span className="strip-icon">✦</span>
+            <span className="strip-icon">*</span>
             <div><strong>Your night, your choice</strong><p>Browse movies and choose a showtime.</p></div>
           </div>
           <div>
-            <span className="strip-icon">◈</span>
+            <span className="strip-icon">*</span>
             <div><strong>Pick your perfect seat</strong><p>Live availability from the booking API.</p></div>
           </div>
           <div>
-            <span className="strip-icon">✓</span>
+            <span className="strip-icon">*</span>
             <div><strong>Booking made clear</strong><p>Review and manage your bookings.</p></div>
           </div>
         </section>
@@ -857,7 +972,7 @@ function App() {
           <span>Cine<span>Book</span></span>
         </a>
         <p>Made for movie people. Built one feature at a time.</p>
-        <span className="footer-status"><span className="live-dot" />DAY 3 · SEAT BOOKING</span>
+        <span className="footer-status"><span className="live-dot" />DAY 4 | PAYMENT SANDBOX</span>
       </footer>
     </div>
   );
