@@ -1,4 +1,4 @@
-﻿from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import select
@@ -14,6 +14,7 @@ from app.booking_schemas import (
     SeatResponse,
 )
 from app.database import get_db
+from app.event_publisher import publish_event
 from app.user_models import User
 
 router = APIRouter(tags=["Seat Booking"])
@@ -172,6 +173,16 @@ def create_booking(
             status_code=409,
             detail="This seat was just reserved by another customer. Please choose another seat.",
         )
+
+    publish_event(
+        "booking.created",
+        {
+            "booking_id": booking.id,
+            "showtime_id": booking.showtime_id,
+            "seat_number": booking.seat_number,
+            "status": booking.status,
+        },
+    )
 
     return booking
 

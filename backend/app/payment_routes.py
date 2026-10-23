@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 from app.auth_routes import get_current_user
 from app.booking_models import Booking, Payment, Showtime
 from app.database import get_db
+from app.event_publisher import publish_event
 from app.user_models import User
 
 router = APIRouter(prefix="/api/payments", tags=["Sandbox Payments"])
@@ -98,6 +99,17 @@ def simulate_payment(
     try:
         db.commit()
         db.refresh(payment)
+
+        publish_event(
+            "payment.succeeded" if payment.status == "succeeded" else "payment.failed",
+            {
+                "payment_id": payment.id,
+                "booking_id": payment.booking_id,
+                "status": payment.status,
+                "amount_rupees": f"{payment.amount_paise / 100:.2f}",
+                "currency": payment.currency,
+            },
+        )
     except IntegrityError:
         db.rollback()
         raise HTTPException(
