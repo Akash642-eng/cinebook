@@ -19,6 +19,7 @@ jobs:
       run:
         working-directory: backend
     env:
+      PYTHONPATH: .
       DATABASE_URL: sqlite:////tmp/cinebook-ci-test.db
       JWT_SECRET: ci-only-test-secret-not-for-production
       RABBITMQ_PASSWORD: ci-only-test-password
@@ -93,3 +94,4 @@ jobs:
           context: ./frontend
           push: false
           tags: cinebook-frontend:ci
+
