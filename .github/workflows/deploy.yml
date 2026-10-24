@@ -33,8 +33,13 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
 
-          if ($env:IMAGE_TAG -notmatch '^[0-9a-f]{40}$') {
-            throw "image_tag must be a full 40-character lowercase commit SHA."
+          $ImageTag = [string]$env:IMAGE_TAG
+          if ($null -eq $ImageTag) { $ImageTag = "" }
+          $ImageTag = $ImageTag.Trim().Trim('"').Trim("'")
+          Write-Host "Image tag length received: $($ImageTag.Length)"
+
+          if ($ImageTag -notmatch '^[0-9a-f]{40}$') {
+            throw "Invalid image_tag. Enter exactly the full 40-character lowercase SHA shown in the workflow dispatch form."
           }
 
           $Context = kubectl config current-context
@@ -43,8 +48,8 @@ jobs:
           }
 
           $Namespace = "cinebook"
-          $BackendImage = "ghcr.io/akash642-eng/cinebook-backend:$env:IMAGE_TAG"
-          $FrontendImage = "ghcr.io/akash642-eng/cinebook-frontend:$env:IMAGE_TAG"
+          $BackendImage = "ghcr.io/akash642-eng/cinebook-backend:$ImageTag"
+          $FrontendImage = "ghcr.io/akash642-eng/cinebook-frontend:$ImageTag"
 
           foreach ($Image in @($BackendImage, $FrontendImage)) {
             docker manifest inspect $Image *> $null
@@ -65,7 +70,7 @@ jobs:
 
           Write-Host "Previous backend image: $OldBackend"
           Write-Host "Previous frontend image: $OldFrontend"
-          Write-Host "Deploying tag: $env:IMAGE_TAG"
+          Write-Host "Deploying tag: $ImageTag"
 
           try {
             kubectl set image deployment/cinebook-backend "backend=$BackendImage" -n $Namespace
