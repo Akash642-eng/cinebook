@@ -1,0 +1,101 @@
+﻿name: Deploy CineBook to Minikube
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "Full 40-character Git commit SHA published to GHCR"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cinebook-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy approved image
+    runs-on: [self-hosted, Windows, X64]
+    environment: production
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Validate images and deploy
+        shell: powershell
+        env:
+          IMAGE_TAG: ${{ inputs.image_tag }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          if ($env:IMAGE_TAG -notmatch '^[0-9a-f]{40}$') {
+            throw "image_tag must be a full 40-character lowercase commit SHA."
+          }
+
+          $Context = kubectl config current-context
+          if ($LASTEXITCODE -ne 0 -or $Context.Trim() -ne "minikube") {
+            throw "Expected Kubernetes context minikube. No deployment performed."
+          }
+
+          $Namespace = "cinebook"
+          $BackendImage = "ghcr.io/akash642-eng/cinebook-backend:$env:IMAGE_TAG"
+          $FrontendImage = "ghcr.io/akash642-eng/cinebook-frontend:$env:IMAGE_TAG"
+
+          foreach ($Image in @($BackendImage, $FrontendImage)) {
+            docker manifest inspect $Image *> $null
+            if ($LASTEXITCODE -ne 0) {
+              throw "Image not found in GHCR: $Image. No deployment performed."
+            }
+          }
+
+          $OldBackend = kubectl get deployment cinebook-backend -n $Namespace -o "jsonpath={.spec.template.spec.containers[?(@.name=='backend')].image}"
+          if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($OldBackend)) {
+            throw "Could not read current backend image."
+          }
+
+          $OldFrontend = kubectl get deployment cinebook-frontend -n $Namespace -o "jsonpath={.spec.template.spec.containers[?(@.name=='frontend')].image}"
+          if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($OldFrontend)) {
+            throw "Could not read current frontend image."
+          }
+
+          Write-Host "Previous backend image: $OldBackend"
+          Write-Host "Previous frontend image: $OldFrontend"
+          Write-Host "Deploying tag: $env:IMAGE_TAG"
+
+          try {
+            kubectl set image deployment/cinebook-backend "backend=$BackendImage" -n $Namespace
+            if ($LASTEXITCODE -ne 0) { throw "Failed to update backend image." }
+
+            kubectl set image deployment/cinebook-frontend "frontend=$FrontendImage" -n $Namespace
+            if ($LASTEXITCODE -ne 0) { throw "Failed to update frontend image." }
+
+            kubectl rollout status deployment/cinebook-backend -n $Namespace --timeout=180s
+            if ($LASTEXITCODE -ne 0) { throw "Backend rollout failed." }
+
+            kubectl rollout status deployment/cinebook-frontend -n $Namespace --timeout=180s
+            if ($LASTEXITCODE -ne 0) { throw "Frontend rollout failed." }
+
+            kubectl get pods -n $Namespace
+            if ($LASTEXITCODE -ne 0) { throw "Could not verify CineBook pods." }
+
+            kubectl get endpoints cinebook-backend -n $Namespace
+            if ($LASTEXITCODE -ne 0) { throw "Could not verify backend endpoints." }
+
+            Write-Host "Deployment and rollout checks succeeded."
+          }
+          catch {
+            Write-Host "Deployment failed. Restoring previous application images." -ForegroundColor Yellow
+
+            kubectl set image deployment/cinebook-backend "backend=$OldBackend" -n $Namespace
+            kubectl set image deployment/cinebook-frontend "frontend=$OldFrontend" -n $Namespace
+
+            kubectl rollout status deployment/cinebook-backend -n $Namespace --timeout=180s
+            kubectl rollout status deployment/cinebook-frontend -n $Namespace --timeout=180s
+
+            throw
+          }
