@@ -1,6 +1,7 @@
-﻿from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, HTTPException
+from app.metrics import install_metrics
 from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 
@@ -73,6 +74,8 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+install_metrics(app)
+
 app.include_router(auth_router)
 app.include_router(admin_router)
 app.include_router(booking_router)
@@ -118,6 +121,3 @@ def get_movie(movie_id: int, db: Session = Depends(get_db)):
     if movie is None or not movie.is_active:
         raise HTTPException(status_code=404, detail="Movie not found")
     return movie
-
-
-

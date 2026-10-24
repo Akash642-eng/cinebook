@@ -50,3 +50,11 @@ docker-compose.yml.*backup*
 
 # Track application database migrations
 !backend/migrations/*.sql
+
+# Generated Helm render output
+/helm/cinebook-rendered.yaml
+
+actions-runner/
+
+# Generated local SQLite test database
+/backend/cinebook-ci-test.db
