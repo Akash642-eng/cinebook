@@ -65,6 +65,7 @@ jobs:
 
           $Namespace = "cinebook-rollback-test-$env:GITHUB_RUN_ID"
           $ManifestPath = Join-Path $env:RUNNER_TEMP "rollback-probe-$env:GITHUB_RUN_ID.json"
+          $ServiceManifestPath = Join-Path $env:RUNNER_TEMP "rollback-probe-service-$env:GITHUB_RUN_ID.json"
           $NamespaceCreated = $false
           $CopiedSecretPaths = @()
 
@@ -102,6 +103,29 @@ jobs:
               kubectl apply -f $SecretPath
               if ($LASTEXITCODE -ne 0) { throw "Could not copy image-pull secret $SecretName into isolated test namespace." }
             }
+
+            # The frontend NGINX config resolves this Service at startup. Provide an endpoint-free
+            # stub with that DNS name only inside the temporary namespace; it cannot route to prod.
+            $BackendStub = @{
+              apiVersion = "v1"
+              kind = "Service"
+              metadata = @{
+                name = "cinebook-backend"
+                namespace = $Namespace
+                labels = @{ purpose = "cinebook-rollback-test" }
+              }
+              spec = @{
+                selector = @{ app = "no-test-pod-matches-this-label" }
+                ports = @(@{ name = "http"; port = 8000; targetPort = 8000 })
+              }
+            }
+            [System.IO.File]::WriteAllText(
+              $ServiceManifestPath,
+              ($BackendStub | ConvertTo-Json -Depth 20),
+              [System.Text.UTF8Encoding]::new($false)
+            )
+            kubectl apply -f $ServiceManifestPath
+            if ($LASTEXITCODE -ne 0) { throw "Could not create endpoint-free backend DNS stub in the test namespace." }
 
             $Manifest = @{
               apiVersion = "apps/v1"
@@ -149,6 +173,7 @@ jobs:
             if ($LASTEXITCODE -ne 0) {
               Write-Host "Baseline pod diagnostics (no secret values):"
               kubectl get pods -n $Namespace -o wide
+              kubectl logs deployment/rollback-probe -n $Namespace --all-containers=true --tail=100
               kubectl describe pods -n $Namespace
               kubectl get events -n $Namespace --sort-by=.metadata.creationTimestamp
               throw "Baseline frontend probe did not become healthy; rollback test cannot continue."
@@ -197,6 +222,7 @@ jobs:
           }
           finally {
             if (Test-Path $ManifestPath) { Remove-Item $ManifestPath -Force -ErrorAction SilentlyContinue }
+            if (Test-Path $ServiceManifestPath) { Remove-Item $ServiceManifestPath -Force -ErrorAction SilentlyContinue }
             foreach ($SecretPath in $CopiedSecretPaths) {
               if (Test-Path $SecretPath) { Remove-Item $SecretPath -Force -ErrorAction SilentlyContinue }
             }
