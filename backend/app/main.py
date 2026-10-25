@@ -10,10 +10,12 @@ from app.admin_routes import router as admin_router
 from app.booking_routes import router as booking_router
 from app.booking_customer_routes import router as booking_customer_router
 from app.payment_routes import router as payment_router
+from app.ticket_routes import router as ticket_router
 from app.database import Base, engine, get_db
 from app.models import Movie
-from app.booking_models import Booking, Cinema, Screen, Showtime
+from app.booking_models import Booking, Cinema, Screen, Showtime, Ticket
 from app.user_models import User
+from app.event_models import ProcessedEvent
 from app.schemas import MovieResponse
 
 
@@ -81,6 +83,7 @@ app.include_router(admin_router)
 app.include_router(booking_router)
 app.include_router(booking_customer_router)
 app.include_router(payment_router)
+app.include_router(ticket_router)
 
 
 @app.get("/api/health")

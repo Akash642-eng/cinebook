@@ -1,0 +1,120 @@
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cinebook-backend
+  namespace: cinebook
+  labels:
+    app: cinebook-backend
+
+spec:
+  replicas: 1
+
+  strategy:
+    type: Recreate
+
+  selector:
+    matchLabels:
+      app: cinebook-backend
+
+  template:
+    metadata:
+      labels:
+        app: cinebook-backend
+
+    spec:
+      containers:
+        - name: backend
+          image: cinebook-backend:latest
+          imagePullPolicy: IfNotPresent
+
+          ports:
+            - name: http
+              containerPort: 8000
+              protocol: TCP
+
+          env:
+            # Define the password first so DATABASE_URL can reference it.
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: cinebook-secrets
+                  key: POSTGRES_PASSWORD
+
+            - name: DATABASE_URL
+              value: "postgresql+psycopg://cinebook:$(POSTGRES_PASSWORD)@cinebook-postgres:5432/cinebook"
+
+            - name: JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: cinebook-secrets
+                  key: JWT_SECRET
+
+            - name: RABBITMQ_HOST
+              value: "cinebook-rabbitmq"
+
+            - name: RABBITMQ_PORT
+              value: "5672"
+
+            - name: RABBITMQ_USER
+              value: "cinebook"
+
+            - name: RABBITMQ_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: cinebook-secrets
+                  key: RABBITMQ_PASSWORD
+
+          startupProbe:
+            httpGet:
+              path: /api/health
+              port: http
+            periodSeconds: 5
+            failureThreshold: 24
+            timeoutSeconds: 3
+
+          readinessProbe:
+            httpGet:
+              path: /api/ready
+              port: http
+            periodSeconds: 10
+            failureThreshold: 3
+            timeoutSeconds: 5
+
+          livenessProbe:
+            httpGet:
+              path: /api/health
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 20
+            failureThreshold: 3
+            timeoutSeconds: 3
+
+          resources:
+            requests:
+              cpu: 100m
+              memory: 192Mi
+            limits:
+              cpu: 400m
+              memory: 384Mi
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cinebook-backend
+  namespace: cinebook
+  labels:
+    app: cinebook-backend
+
+spec:
+  type: ClusterIP
+
+  selector:
+    app: cinebook-backend
+
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http
+      protocol: TCP

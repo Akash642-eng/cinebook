@@ -1,0 +1,61 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cinebook-frontend
+  namespace: cinebook
+  labels:
+    app: cinebook-frontend
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: cinebook-frontend
+  template:
+    metadata:
+      labels:
+        app: cinebook-frontend
+    spec:
+      containers:
+        - name: frontend
+          image: cinebook-frontend:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /api/health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+          livenessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 20
+            timeoutSeconds: 3
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cinebook-frontend
+  namespace: cinebook
+spec:
+  type: ClusterIP
+  selector:
+    app: cinebook-frontend
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+      protocol: TCP

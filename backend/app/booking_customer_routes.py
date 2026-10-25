@@ -140,29 +140,26 @@ def create_booking(
         .where(
             Booking.showtime_id == request.showtime_id,
             Booking.seat_number == request.seat_number,
+            Booking.status.in_(["pending_payment", "confirmed"]),
         )
         .with_for_update()
     )
 
-    if existing is not None and existing.status in ("pending_payment", "confirmed"):
+    if existing is not None:
         raise HTTPException(
             status_code=409,
             detail="This seat is already booked or awaiting payment",
         )
 
-    if existing is not None:
-        existing.user_id = current_user.id
-        existing.status = "pending_payment"
-        existing.booked_at = datetime.now(timezone.utc)
-        booking = existing
-    else:
-        booking = Booking(
-            user_id=current_user.id,
-            showtime_id=request.showtime_id,
-            seat_number=request.seat_number,
-            status="pending_payment",
-        )
-        db.add(booking)
+    # Keep cancelled bookings as historical records.
+    # A new reservation receives a new booking ID.
+    booking = Booking(
+        user_id=current_user.id,
+        showtime_id=request.showtime_id,
+        seat_number=request.seat_number,
+        status="pending_payment",
+    )
+    db.add(booking)
 
     try:
         db.commit()
@@ -222,6 +219,13 @@ def cancel_booking(
 
     if booking.status == "cancelled":
         raise HTTPException(status_code=409, detail="Booking is already cancelled")
+
+
+    if booking.status != "pending_payment":
+        raise HTTPException(
+            status_code=409,
+            detail="Confirmed bookings cannot be cancelled because sandbox refunds are not implemented",
+        )
 
     showtime = db.get(Showtime, booking.showtime_id)
     if showtime is None:

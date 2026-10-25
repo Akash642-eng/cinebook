@@ -45,16 +45,23 @@ services:
       start_period: 15s
     restart: unless-stopped
 
+    networks:
+      default:
+        aliases:
+          - cinebook-backend
   worker:
     build:
       context: ./backend
     command: ["python", "-m", "app.notification_worker"]
     environment:
+      DATABASE_URL: postgresql+psycopg://cinebook:${POSTGRES_PASSWORD}@db:5432/cinebook
       RABBITMQ_HOST: rabbitmq
       RABBITMQ_PORT: "5672"
       RABBITMQ_USER: cinebook
       RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD:?Set RABBITMQ_PASSWORD in .env}
     depends_on:
+      db:
+        condition: service_healthy
       rabbitmq:
         condition: service_healthy
     restart: unless-stopped
@@ -63,7 +70,7 @@ services:
     build:
       context: ./frontend
     ports:
-      - "127.0.0.1:5173:5173"
+      - "127.0.0.1:5173:8080"
     depends_on:
       backend:
         condition: service_healthy
@@ -72,6 +79,9 @@ services:
   rabbitmq:
     image: rabbitmq:4-management
     hostname: cinebook-rabbitmq
+    environment:
+      RABBITMQ_DEFAULT_USER: cinebook
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:?Set RABBITMQ_PASSWORD in .env}
     ports:
       - "127.0.0.1:15672:15672"
     volumes:

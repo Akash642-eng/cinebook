@@ -1,14 +1,16 @@
-﻿
+
 from datetime import datetime
 
 from sqlalchemy import (
     CheckConstraint,
     DateTime,
     ForeignKey,
+    Index,
     Integer,
     String,
     UniqueConstraint,
     func,
+    text,
 )
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -80,10 +82,12 @@ class Showtime(Base):
 class Booking(Base):
     __tablename__ = "bookings"
     __table_args__ = (
-        UniqueConstraint(
+        Index(
+            "uq_booking_showtime_seat_active",
             "showtime_id",
             "seat_number",
-            name="uq_booking_showtime_seat",
+            unique=True,
+            postgresql_where=text("status IN ('pending_payment', 'confirmed')"),
         ),
         CheckConstraint("seat_number > 0", name="ck_booking_seat_positive"),
         CheckConstraint(
@@ -161,6 +165,10 @@ class Payment(Base):
         unique=True,
         nullable=False,
     )
+    idempotency_key: Mapped[str | None] = mapped_column(
+        String(100),
+        nullable=True,
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         server_default=func.now(),
@@ -170,5 +178,23 @@ class Payment(Base):
         DateTime(timezone=True),
         server_default=func.now(),
         onupdate=func.now(),
+        nullable=False,
+    )
+
+
+class Ticket(Base):
+    __tablename__ = "tickets"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    booking_id: Mapped[int] = mapped_column(
+        ForeignKey("bookings.id", ondelete="RESTRICT"),
+        nullable=False,
+        unique=True,
+        index=True,
+    )
+    token: Mapped[str] = mapped_column(String(100), nullable=False, unique=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
         nullable=False,
     )

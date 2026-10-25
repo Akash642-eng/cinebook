@@ -8,7 +8,8 @@ from pika.exceptions import AMQPError
 
 logger = logging.getLogger("cinebook.events")
 
-QUEUE_NAME = "cinebook.notifications"
+EXCHANGE_NAME = "cinebook.events.v2"
+QUEUE_NAME = "cinebook.notifications.v2"
 
 
 def publish_event(event_type: str, payload: dict) -> bool:
@@ -45,22 +46,39 @@ def publish_event(event_type: str, payload: dict) -> bool:
         connection = pika.BlockingConnection(parameters)
         channel = connection.channel()
 
+        channel.exchange_declare(
+            exchange=EXCHANGE_NAME,
+            exchange_type="direct",
+            durable=True,
+        )
+
         channel.queue_declare(
             queue=QUEUE_NAME,
             durable=True,
+            arguments={
+                "x-dead-letter-exchange": EXCHANGE_NAME,
+                "x-dead-letter-routing-key": "dead",
+            },
+        )
+
+        channel.queue_bind(
+            queue=QUEUE_NAME,
+            exchange=EXCHANGE_NAME,
+            routing_key="notification",
         )
 
         channel.confirm_delivery()
 
         channel.basic_publish(
-            exchange="",
-            routing_key=QUEUE_NAME,
+            exchange=EXCHANGE_NAME,
+            routing_key="notification",
             body=json.dumps(event, separators=(",", ":")),
             properties=pika.BasicProperties(
                 content_type="application/json",
                 delivery_mode=2,
                 message_id=event["event_id"],
                 type=event_type,
+                headers={"x-retry-count": 0},
             ),
             mandatory=True,
         )
