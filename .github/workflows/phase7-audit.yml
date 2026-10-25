@@ -1,0 +1,95 @@
+name: CineBook Phase 7 Kubernetes Audit
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/phase7-audit.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cinebook-phase7-audit
+  cancel-in-progress: false
+
+jobs:
+  audit:
+    name: Read-only Minikube workload audit
+    runs-on: [self-hosted, Windows, X64]
+    timeout-minutes: 5
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Inspect live Kubernetes configuration without exposing secret values
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $context = kubectl config current-context
+          if ($LASTEXITCODE -ne 0 -or $context.Trim() -ne "minikube") {
+            throw "Expected Kubernetes context minikube; audit stopped without changes."
+          }
+
+          $ns = "cinebook"
+          Write-Host "=== RELEASE CONTEXT ==="
+          Write-Host "Context: $($context.Trim())"
+          Write-Host "Git revision: $env:GITHUB_SHA"
+
+          Write-Host "`n=== NODES ==="
+          kubectl get nodes -o wide
+          if ($LASTEXITCODE -ne 0) { throw "Unable to list nodes." }
+
+          Write-Host "`n=== DEPLOYMENTS / PROBES / RESOURCES / SECRET REFERENCES ==="
+          $deployments = kubectl get deployments -n $ns -o json | ConvertFrom-Json
+          foreach ($d in $deployments.items) {
+            Write-Host "`nDeployment: $($d.metadata.name); replicas desired=$($d.spec.replicas), ready=$($d.status.readyReplicas), available=$($d.status.availableReplicas)"
+            foreach ($c in $d.spec.template.spec.containers) {
+              Write-Host "  Container: $($c.name)"
+              Write-Host "    Image: $($c.image)"
+              Write-Host "    Requests: $(($c.resources.requests | ConvertTo-Json -Compress -Depth 5))"
+              Write-Host "    Limits: $(($c.resources.limits | ConvertTo-Json -Compress -Depth 5))"
+              foreach ($probeName in @("startupProbe","readinessProbe","livenessProbe")) {
+                $probe = $c.$probeName
+                if ($null -eq $probe) { Write-Host "    $($probeName): MISSING" }
+                else { Write-Host "    $($probeName): $(($probe | ConvertTo-Json -Compress -Depth 8))" }
+              }
+              foreach ($e in $c.env) {
+                if ($e.valueFrom.secretKeyRef) { Write-Host "    Env $($e.name): secretRef=$($e.valueFrom.secretKeyRef.name), key=$($e.valueFrom.secretKeyRef.key)" }
+                elseif ($e.valueFrom.configMapKeyRef) { Write-Host "    Env $($e.name): configMapRef=$($e.valueFrom.configMapKeyRef.name), key=$($e.valueFrom.configMapKeyRef.key)" }
+                elseif ($null -ne $e.value) { Write-Host "    Env $($e.name): literal value configured (value deliberately hidden)" }
+                else { Write-Host "    Env $($e.name): present" }
+              }
+              foreach ($ve in $c.volumeMounts) { Write-Host "    Mount: $($ve.name) -> $($ve.mountPath); readOnly=$($ve.readOnly)" }
+            }
+            foreach ($v in $d.spec.template.spec.volumes) {
+              if ($v.persistentVolumeClaim) { Write-Host "    PVC volume: $($v.name) -> $($v.persistentVolumeClaim.claimName)" }
+              elseif ($v.secret) { Write-Host "    Secret volume: $($v.name) -> $($v.secret.secretName)" }
+              elseif ($v.configMap) { Write-Host "    ConfigMap volume: $($v.name) -> $($v.configMap.name)" }
+            }
+            Write-Host "  Image pull secret names: $((@($d.spec.template.spec.imagePullSecrets | ForEach-Object { $_.name }) -join ', '))"
+          }
+
+          Write-Host "`n=== PODS AND RESTART COUNTS ==="
+          kubectl get pods -n $ns -o wide
+          if ($LASTEXITCODE -ne 0) { throw "Unable to list application pods." }
+
+          Write-Host "`n=== SERVICES AND ENDPOINTS ==="
+          kubectl get services,endpointslices -n $ns -o wide
+          if ($LASTEXITCODE -ne 0) { throw "Unable to list services or EndpointSlices." }
+
+          Write-Host "`n=== PVC STATUS / STORAGE CLASS / CAPACITY ==="
+          kubectl get pvc -n $ns -o custom-columns="NAME:.metadata.name,STATUS:.status.phase,CAPACITY:.status.capacity.storage,ACCESS:.spec.accessModes[*],STORAGECLASS:.spec.storageClassName,VOLUME:.spec.volumeName"
+          if ($LASTEXITCODE -ne 0) { throw "Unable to list PVCs." }
+
+          Write-Host "`n=== INGRESS ==="
+          kubectl get ingress -n $ns -o wide
+          if ($LASTEXITCODE -ne 0) { throw "Unable to list Ingress resources." }
+
+          Write-Host "`n=== NAMESPACE SECRET NAMES ONLY (NO DATA) ==="
+          kubectl get secrets -n $ns -o custom-columns="NAME:.metadata.name,TYPE:.type,AGE:.metadata.creationTimestamp"
+          if ($LASTEXITCODE -ne 0) { throw "Unable to list Secret metadata." }
+
+          Write-Host "`n=== READ-ONLY AUDIT COMPLETE ==="
