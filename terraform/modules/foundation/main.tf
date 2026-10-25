@@ -301,7 +301,7 @@ resource "aws_iam_role_policy" "github_ecr_publish" {
       },
       {
         Sid    = "PublishOnlyCineBookImages"
-        Effect   = "Allow"
+        Effect = "Allow"
         Action = local.ecr_publish_actions
         Resource = [
           aws_ecr_repository.backend.arn,
