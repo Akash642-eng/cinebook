@@ -67,6 +67,8 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: cinebook-phase8-terraform-plan
-          path: terraform/phase8-plan.txt
+          path: |
+            terraform/phase8-plan.txt
+            terraform/.terraform.lock.hcl
           if-no-files-found: error
           retention-days: 7
