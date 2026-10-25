@@ -86,6 +86,7 @@ jobs:
           $RestoreDb = "phase7r$RunId"
           $RestoreDbCreated = $false
           $IngressPath = Join-Path $env:RUNNER_TEMP "cinebook-ingress-$RunId.yaml"
+          $StartupPatchPath = Join-Path $env:RUNNER_TEMP "cinebook-frontend-startup-$RunId.json"
           $RabbitQueue = "phase7-persistence-$RunId"
           $RabbitQueueCreated = $false
           $RabbitPassword = $null
@@ -187,8 +188,25 @@ jobs:
             $frontendContainer = $frontendJson.spec.template.spec.containers | Where-Object { $_.name -eq "frontend" } | Select-Object -First 1
             if ($null -eq $frontendContainer.startupProbe) {
               Write-Host "Adding missing frontend startup probe."
-              $patch = '{"spec":{"template":{"spec":{"containers":[{"name":"frontend","startupProbe":{"httpGet":{"path":"/","port":"http","scheme":"HTTP"},"periodSeconds":5,"timeoutSeconds":3,"failureThreshold":24}}]}}}}'
-              kubectl patch deployment cinebook-frontend -n $Namespace --type strategic --patch $patch
+              $patchObject = @{
+                spec = @{
+                  template = @{
+                    spec = @{
+                      containers = @(@{
+                        name = "frontend"
+                        startupProbe = @{
+                          httpGet = @{ path = "/"; port = "http"; scheme = "HTTP" }
+                          periodSeconds = 5
+                          timeoutSeconds = 3
+                          failureThreshold = 24
+                        }
+                      })
+                    }
+                  }
+                }
+              }
+              [System.IO.File]::WriteAllText($StartupPatchPath, ($patchObject | ConvertTo-Json -Depth 20 -Compress), [System.Text.UTF8Encoding]::new($false))
+              kubectl patch deployment cinebook-frontend -n $Namespace --type=strategic --patch-file $StartupPatchPath
               if ($LASTEXITCODE -ne 0) { throw "Could not patch frontend startup probe." }
               kubectl rollout status deployment/cinebook-frontend -n $Namespace --timeout=180s
               if ($LASTEXITCODE -ne 0) { throw "Frontend failed rollout after startup probe was added." }
@@ -378,5 +396,6 @@ jobs:
             }
             if (Test-Path $BackupPath) { Remove-Item $BackupPath -Force -ErrorAction SilentlyContinue }
             if (Test-Path $IngressPath) { Remove-Item $IngressPath -Force -ErrorAction SilentlyContinue }
+            if (Test-Path $StartupPatchPath) { Remove-Item $StartupPatchPath -Force -ErrorAction SilentlyContinue }
             $RabbitPassword = $null
           }
