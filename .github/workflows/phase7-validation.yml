@@ -357,8 +357,20 @@ jobs:
               $publishBody = @{ properties = @{ delivery_mode = 2 }; routing_key = $RabbitQueue; payload = $marker; payload_encoding = "string" } | ConvertTo-Json -Depth 10
               $publishResult = Invoke-RestMethod -Method Post -Uri ($RabbitBase + "/api/exchanges/%2F/amq.default/publish") -Headers $RabbitHeaders -ContentType "application/json" -Body $publishBody -TimeoutSec 10
               if (-not $publishResult.routed) { throw "RabbitMQ did not route the persistent test message." }
-              $queueState = Invoke-RestMethod -Method Get -Uri ($RabbitBase + "/api/queues/%2F/" + $RabbitQueue) -Headers $RabbitHeaders -TimeoutSec 10
-              if ($queueState.messages_ready -ne 1) { throw "RabbitMQ marker message was not ready before restart." }
+              $queueState = $null
+              for ($i = 0; $i -lt 20; $i++) {
+                $queueState = Invoke-RestMethod -Method Get -Uri ($RabbitBase + "/api/queues/%2F/" + $RabbitQueue) -Headers $RabbitHeaders -TimeoutSec 10
+                if ([int]$queueState.messages -ge 1) { break }
+                Start-Sleep -Milliseconds 500
+              }
+              Write-Host "RabbitMQ queue state before restart: messages=$($queueState.messages); ready=$($queueState.messages_ready); unacknowledged=$($queueState.messages_unacknowledged); consumers=$($queueState.consumers)"
+              $getBody = @{ count = 1; ackmode = "ack_requeue_true"; encoding = "auto"; truncate = 50000 } | ConvertTo-Json -Depth 5
+              $messageBefore = Invoke-RestMethod -Method Post -Uri ($RabbitBase + "/api/queues/%2F/" + $RabbitQueue + "/get") -Headers $RabbitHeaders -ContentType "application/json" -Body $getBody -TimeoutSec 10
+              if (-not $messageBefore -or "$($messageBefore[0].payload)" -ne $marker) {
+                $publishSummary = $publishResult | ConvertTo-Json -Compress -Depth 5
+                $queueSummary = $queueState | Select-Object name,messages,messages_ready,messages_unacknowledged,consumers,durable | ConvertTo-Json -Compress
+                throw "RabbitMQ marker could not be read back before restart. publish=$publishSummary; queue=$queueSummary"
+              }
               Stop-RabbitForward
 
               $rabbitPod = (kubectl get pods -n $Namespace -l app=cinebook-rabbitmq -o "jsonpath={.items[0].metadata.name}").Trim()
@@ -366,9 +378,19 @@ jobs:
               if ($LASTEXITCODE -ne 0) { throw "Could not initiate RabbitMQ pod restart." }
               Wait-PodReady -LabelSelector "app=cinebook-rabbitmq" -TimeoutSeconds 300
               Start-RabbitForward
-              $queueState = Invoke-RestMethod -Method Get -Uri ($RabbitBase + "/api/queues/%2F/" + $RabbitQueue) -Headers $RabbitHeaders -TimeoutSec 10
-              if ($queueState.messages_ready -ne 1) { throw "RabbitMQ durable marker message did not survive pod restart." }
-              Write-Host "PASS: RabbitMQ recovered and one persistent marker message survived restart."
+              $queueState = $null
+              for ($i = 0; $i -lt 20; $i++) {
+                $queueState = Invoke-RestMethod -Method Get -Uri ($RabbitBase + "/api/queues/%2F/" + $RabbitQueue) -Headers $RabbitHeaders -TimeoutSec 10
+                if ([int]$queueState.messages -ge 1) { break }
+                Start-Sleep -Milliseconds 500
+              }
+              Write-Host "RabbitMQ queue state after restart: messages=$($queueState.messages); ready=$($queueState.messages_ready); unacknowledged=$($queueState.messages_unacknowledged); consumers=$($queueState.consumers)"
+              $messageAfter = Invoke-RestMethod -Method Post -Uri ($RabbitBase + "/api/queues/%2F/" + $RabbitQueue + "/get") -Headers $RabbitHeaders -ContentType "application/json" -Body $getBody -TimeoutSec 10
+              if (-not $messageAfter -or "$($messageAfter[0].payload)" -ne $marker) {
+                $queueSummary = $queueState | Select-Object name,messages,messages_ready,messages_unacknowledged,consumers,durable | ConvertTo-Json -Compress
+                throw "RabbitMQ persistent marker did not survive pod restart. queue=$queueSummary"
+              }
+              Write-Host "PASS: RabbitMQ recovered and marker payload survived pod restart."
               Invoke-RestMethod -Method Delete -Uri ($RabbitBase + "/api/queues/%2F/" + $RabbitQueue) -Headers $RabbitHeaders -TimeoutSec 10 | Out-Null
               $RabbitQueueCreated = $false
               Stop-RabbitForward
