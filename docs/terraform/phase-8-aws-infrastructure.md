@@ -8,8 +8,8 @@
 |---|---|---|
 | Terraform project structure committed | ✅ | `terraform/` root plus `modules/foundation/` |
 | AWS provider and variables configured safely | ✅ | AWS provider pinned to `~> 6.0`; region and network variables; infrastructure disabled by default; no credential literals |
-| Terraform formatting and validation pass | ⏳ | Enforced by [Terraform CI](../../.github/workflows/terraform-ci.yml); final run link to be added after CI completes |
-| Terraform plan inspected before applying | ✅ (offline plan only) | CI saves a readable foundation plan artifact; it uses dummy credentials and `-refresh=false`, with no AWS API access or apply |
+| Terraform formatting and validation pass | ✅ | [Terraform CI run #40204539102](https://github.com/Akash642-eng/cinebook/actions/runs/40204539102) passed `terraform fmt -diff -check -recursive`, `terraform init -backend=false`, and `terraform validate` |
+| Terraform plan inspected before applying | ✅ (offline plan only) | [Run #40204539102](https://github.com/Akash642-eng/cinebook/actions/runs/40204539102) uploaded artifact `cinebook-phase8-terraform-plan`: **20 to add, 0 to change, 0 to destroy**. This is a simulated offline plan, not an account-aware cost/drift plan |
 | Networking/security boundaries documented | ✅ | Public ingress subnets, isolated private subnets, ALB/app/PostgreSQL/RabbitMQ security groups |
 | Deployment resources match intended architecture | ✅ (foundation only) | VPC, subnets, route tables, security groups, ECR; no application compute or managed data services yet |
 | IAM roles follow least privilege | ✅ (optional ECR role) | Role is disabled until the existing GitHub OIDC provider ARN is supplied; it is scoped to main branch and two ECR repositories |
@@ -48,7 +48,7 @@ terraform plan -refresh=false -var="enable_infrastructure=false"
 ```
 
 The offline populated plan is for review only and cannot be applied because it uses dummy credentials:
-`terraform plan -refresh=false -var="enable_infrastructure=true" -var="offline_plan_validation=true -out=phase8-plan.tfplan`
+`terraform plan -refresh=false -var="enable_infrastructure=true" -var="offline_plan_validation=true" -out=phase8-plan.tfplan`
 
 ## Gate before a real AWS apply
 
