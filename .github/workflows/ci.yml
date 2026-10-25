@@ -87,6 +87,7 @@ jobs:
         with:
           context: ./backend
           push: false
+          load: true
           tags: cinebook-backend:ci
 
       - name: Build frontend image
@@ -94,7 +95,28 @@ jobs:
         with:
           context: ./frontend
           push: false
+          load: true
           tags: cinebook-frontend:ci
+
+      - name: Scan backend image with Trivy
+        uses: aquasecurity/trivy-action@0.36.0
+        with:
+          image-ref: cinebook-backend:ci
+          format: table
+          exit-code: "1"
+          ignore-unfixed: true
+          vuln-type: os,library
+          severity: HIGH,CRITICAL
+
+      - name: Scan frontend image with Trivy
+        uses: aquasecurity/trivy-action@0.36.0
+        with:
+          image-ref: cinebook-frontend:ci
+          format: table
+          exit-code: "1"
+          ignore-unfixed: true
+          vuln-type: os,library
+          severity: HIGH,CRITICAL
 
   publish-images:
     name: Publish images to GHCR
