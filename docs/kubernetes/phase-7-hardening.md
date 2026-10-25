@@ -1,27 +1,48 @@
 # CineBook Phase 7 — Kubernetes Deployment & Hardening
 
-## Live baseline observed
+**Status: COMPLETE — validation run [#40198960374](https://github.com/Akash642-eng/cinebook/actions/runs/40198960374) passed on 2026-10-25.**
 
-The read-only Minikube audit confirmed:
+## Live baseline and final validation
 
-- Backend and frontend: each 1/1 Ready and sharing the same Git-SHA image tag.
-- PostgreSQL and RabbitMQ: each 1/1 Ready and each mounts its existing PVC.
-- PostgreSQL PVC: `Bound`, 2Gi, `ReadWriteOnce`, storage class `standard`.
-- RabbitMQ PVC: `Bound`, 1Gi, `ReadWriteOnce`, storage class `standard`.
-- Backend, PostgreSQL and RabbitMQ had startup/readiness/liveness probes and CPU/memory requests/limits.
-- Frontend had readiness/liveness probes and resource requests/limits but no startup probe.
-- The app containers reference `cinebook-secrets`; secret values were never printed.
-- No Ingress resource or tracked Kubernetes/Helm definitions existed at audit time.
+The read-only Minikube audit and Phase 7 hardening workflow confirmed:
 
-The Phase 7 validation workflow tracks a Helm chart, adds the frontend startup probe, lints/renders the chart, configures NGINX Ingress, checks the health route, tests PostgreSQL backup/restore in a temporary database, verifies PostgreSQL row-count fingerprints across a pod restart, verifies a durable RabbitMQ marker message survives a pod restart, and tests an actual app-image rollback to a prior known-good SHA followed by restoration of the originally active images.
+| Requirement | Result |
+|---|---|
+| Backend/frontend Deployments and same immutable Git-SHA tag | **PASS** — both initially deployed as `c70ebd7e524bfdfb6eb1263fb516e89fc43cd18f`; exact image pair restored after rollback test |
+| Backend/frontend/PostgreSQL/RabbitMQ rollouts | **PASS** — all four rollouts succeeded |
+| Backend Service discovery and API health | **PASS** — backend EndpointSlice existed; `/api/health` returned healthy through Ingress routing |
+| PostgreSQL/RabbitMQ persistent claims | **PASS** — `cinebook-postgres-pvc` Bound (2Gi) and `cinebook-rabbitmq-pvc` Bound (1Gi), both ReadWriteOnce, `standard` class |
+| Helm chart from clean checkout | **PASS** — `helm lint` and `helm template` succeeded with existing-claim defaults and with `persistence.createClaims=true` |
+| Startup/readiness/liveness probes | **PASS** — all live containers have all three; the missing frontend startup probe was added and the frontend rollout succeeded |
+| CPU/memory requests and limits | **PASS** — required requests and limits exist for all four live workloads; the full rollout completed. No separate load/stress benchmark was performed |
+| Secret handling | **PASS** — required `cinebook-secrets` keys were present; chart render creates no Secret object or credential literals; values were not printed |
+| Ingress/stable route | **PASS** — NGINX Ingress for host `cinebook.local` was applied; `/api/health` passed through the controller using a local port-forward and matching Host header. Direct browser access through a Windows hosts-file entry was not separately tested |
+| PostgreSQL backup/restore | **PASS** — `pg_dump` restored into a temporary `phase7r*` database; table-by-table row-count fingerprints matched, and the temporary database was dropped |
+| PostgreSQL restart/persistence | **PASS** — pod restarted, `pg_isready` passed, and source database table row-count fingerprints were unchanged |
+| RabbitMQ restart/persistence | **PASS** — durable queue and persistent marker were read before restart; after pod restart the queue and marker payload remained; test queue was removed |
+| Previous-image rollback | **PASS** — both apps rolled back to known-good SHA `746df1897d553ef170d180d7f676ef033da9b2e0`; Ingress health passed; exact original `c70ebd7e524bfdfb6eb1263fb516e89fc43cd18f` image pair was restored and health passed again |
 
-## Safety boundaries
+## Evidence
+
+- [Phase 7 Helm and live hardening run #40198960374](https://github.com/Akash642-eng/cinebook/actions/runs/40198960374) — **success**
+- [Read-only Kubernetes audit run #40197360606](https://github.com/Akash642-eng/cinebook/actions/runs/40197360606) — **success**
+- [Phase 6 release evidence](../releases/2026-10-25-phase6-release-evidence.md)
+
+The live validation run logs show the PostgreSQL restore and restart checks, RabbitMQ message recovery, previous-release health check, and restoration of the original application image pair all passed.
+
+## Safety boundaries retained
 
 - Never delete `cinebook-postgres-pvc`, `cinebook-rabbitmq-pvc`, or their PVs as a recovery shortcut.
-- PostgreSQL backup files are temporary runner files; contents are not printed and the file is removed in `finally`.
-- Restore testing uses a temporary database whose name begins with `phase7r`, compares table-by-table row counts, and drops only that temporary database.
-- RabbitMQ persistence is tested with a uniquely named durable queue and persistent marker message, then the queue is removed.
-- The live image rollback test may cause a short application interruption, but it restores the exact original backend/frontend image pair and does not alter database or RabbitMQ volumes.
-- The chart is linted/rendered but intentionally not installed over existing live resources, since those resources do not have Helm release ownership metadata.
+- The PostgreSQL dump was kept in temporary runner storage, not printed, and removed during cleanup.
+- The restore validation created and dropped only a unique temporary database named with the `phase7r` prefix; it did not overwrite the live `cinebook` database.
+- RabbitMQ validation used a uniquely named durable test queue and removed it after verification.
+- The rollback check temporarily changed only the backend/frontend image references; it restored the exact original pair. PostgreSQL/RabbitMQ storage was not deleted or replaced.
+- The chart is linted/rendered but intentionally not installed over existing live resources because those resources do not have Helm release ownership metadata. A Helm adoption/migration needs a separately reviewed change.
 
-See [Phase 7 Audit](../../.github/workflows/phase7-audit.yml), [Phase 7 Validation](../../.github/workflows/phase7-validation.yml), and [the Helm chart README](../../helm/cinebook/README.md). Add the successful validation run link after the first clean run.
+## Reusable configuration
+
+- [Phase 7 read-only audit workflow](../../.github/workflows/phase7-audit.yml)
+- [Phase 7 hardening workflow](../../.github/workflows/phase7-validation.yml)
+- [CineBook Helm chart README](../../helm/cinebook/README.md)
+
+**Operational note:** this phase validates a single-node Minikube setup. It is not a multi-node high-availability or production disaster-recovery drill; backup retention/off-cluster storage, resource-load testing and direct Windows browser hostname validation remain separate production-readiness improvements.
