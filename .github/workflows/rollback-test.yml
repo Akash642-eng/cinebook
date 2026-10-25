@@ -66,11 +66,42 @@ jobs:
           $Namespace = "cinebook-rollback-test-$env:GITHUB_RUN_ID"
           $ManifestPath = Join-Path $env:RUNNER_TEMP "rollback-probe-$env:GITHUB_RUN_ID.json"
           $NamespaceCreated = $false
+          $CopiedSecretPaths = @()
 
           try {
             kubectl create namespace $Namespace
             if ($LASTEXITCODE -ne 0) { throw "Could not create isolated rollback-test namespace." }
             $NamespaceCreated = $true
+
+            # Copy only registry pull-secret objects referenced by the existing frontend Deployment
+            # or the source namespace's default ServiceAccount. Secret values are not written to logs.
+            $PullSecretNames = @()
+            $DeploymentPullSecrets = kubectl get deployment cinebook-frontend -n cinebook -o "jsonpath={.spec.template.spec.imagePullSecrets[*].name}"
+            if ($LASTEXITCODE -eq 0 -and -not [string]::IsNullOrWhiteSpace($DeploymentPullSecrets)) {
+              $PullSecretNames += $DeploymentPullSecrets -split '\s+'
+            }
+            $ServiceAccountPullSecrets = kubectl get serviceaccount default -n cinebook -o "jsonpath={.imagePullSecrets[*].name}"
+            if ($LASTEXITCODE -eq 0 -and -not [string]::IsNullOrWhiteSpace($ServiceAccountPullSecrets)) {
+              $PullSecretNames += $ServiceAccountPullSecrets -split '\s+'
+            }
+            $PullSecretNames = @($PullSecretNames | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Sort-Object -Unique)
+
+            foreach ($SecretName in $PullSecretNames) {
+              $SecretJson = kubectl get secret $SecretName -n cinebook -o json
+              if ($LASTEXITCODE -ne 0) { throw "Could not read referenced image-pull secret $SecretName from source namespace." }
+              $Secret = $SecretJson | ConvertFrom-Json
+              $Secret.metadata.namespace = $Namespace
+              foreach ($Field in @("uid", "resourceVersion", "creationTimestamp", "managedFields", "selfLink", "ownerReferences", "finalizers", "annotations")) {
+                if ($Secret.metadata.PSObject.Properties[$Field]) {
+                  $Secret.metadata.PSObject.Properties.Remove($Field)
+                }
+              }
+              $SecretPath = Join-Path $env:RUNNER_TEMP "rollback-pull-secret-$SecretName-$env:GITHUB_RUN_ID.json"
+              [System.IO.File]::WriteAllText($SecretPath, ($Secret | ConvertTo-Json -Depth 30), [System.Text.UTF8Encoding]::new($false))
+              $CopiedSecretPaths += $SecretPath
+              kubectl apply -f $SecretPath
+              if ($LASTEXITCODE -ne 0) { throw "Could not copy image-pull secret $SecretName into isolated test namespace." }
+            }
 
             $Manifest = @{
               apiVersion = "apps/v1"
@@ -86,6 +117,7 @@ jobs:
                 template = @{
                   metadata = @{ labels = @{ app = "rollback-probe" } }
                   spec = @{
+                    imagePullSecrets = @($PullSecretNames | ForEach-Object { @{ name = $_ } })
                     containers = @(@{
                       name = "probe"
                       image = $FrontendImage
@@ -114,7 +146,13 @@ jobs:
             if ($LASTEXITCODE -ne 0) { throw "Could not create baseline probe deployment." }
 
             kubectl rollout status deployment/rollback-probe -n $Namespace --timeout=120s
-            if ($LASTEXITCODE -ne 0) { throw "Baseline frontend probe did not become healthy; rollback test cannot continue." }
+            if ($LASTEXITCODE -ne 0) {
+              Write-Host "Baseline pod diagnostics (no secret values):"
+              kubectl get pods -n $Namespace -o wide
+              kubectl describe pods -n $Namespace
+              kubectl get events -n $Namespace --sort-by=.metadata.creationTimestamp
+              throw "Baseline frontend probe did not become healthy; rollback test cannot continue."
+            }
 
             $OldImage = kubectl get deployment rollback-probe -n $Namespace -o "jsonpath={.spec.template.spec.containers[?(@.name=='probe')].image}"
             if ($LASTEXITCODE -ne 0 -or $OldImage.Trim() -ne $FrontendImage) {
@@ -159,6 +197,9 @@ jobs:
           }
           finally {
             if (Test-Path $ManifestPath) { Remove-Item $ManifestPath -Force -ErrorAction SilentlyContinue }
+            foreach ($SecretPath in $CopiedSecretPaths) {
+              if (Test-Path $SecretPath) { Remove-Item $SecretPath -Force -ErrorAction SilentlyContinue }
+            }
             if ($NamespaceCreated) {
               kubectl delete namespace $Namespace --wait=true --timeout=120s
               if ($LASTEXITCODE -ne 0) {
