@@ -261,13 +261,13 @@ resource "aws_iam_role" "github_ecr_publisher" {
   name = "${var.name_prefix}-github-ecr-publisher"
 
   assume_role_policy = jsonencode({
-    Version   = "2012-10-17"
+    Version = "2012-10-17"
     Statement = [{
-      Effect    = "Allow"
+      Effect = "Allow"
       Principal = {
         Federated = var.github_oidc_provider_arn
       }
-      Action    = "sts:AssumeRoleWithWebIdentity"
+      Action = "sts:AssumeRoleWithWebIdentity"
       Condition = {
         StringEquals = {
           "token.actions.githubusercontent.com:aud" = "sts.amazonaws.com"
@@ -295,14 +295,14 @@ resource "aws_iam_role_policy" "github_ecr_publish" {
     Statement = [
       {
         Sid      = "GetEcrLoginToken"
-        Effect   = "Allow"
+        Effect = "Allow"
         Action   = ["ecr:GetAuthorizationToken"]
         Resource = "*"
       },
       {
-        Sid      = "PublishOnlyCineBookImages"
+        Sid    = "PublishOnlyCineBookImages"
         Effect   = "Allow"
-        Action   = local.ecr_publish_actions
+        Action = local.ecr_publish_actions
         Resource = [
           aws_ecr_repository.backend.arn,
           aws_ecr_repository.frontend.arn
