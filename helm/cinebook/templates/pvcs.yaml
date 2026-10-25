@@ -1,0 +1,31 @@
+{{- if .Values.persistence.createClaims }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ .Values.postgres.persistence.existingClaim }}
+  labels:
+    app: cinebook-postgres
+    app.kubernetes.io/part-of: cinebook
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: {{ .Values.postgres.persistence.size }}
+  storageClassName: {{ .Values.postgres.persistence.storageClassName | quote }}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ .Values.rabbitmq.persistence.existingClaim }}
+  labels:
+    app: cinebook-rabbitmq
+    app.kubernetes.io/part-of: cinebook
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: {{ .Values.rabbitmq.persistence.size }}
+  storageClassName: {{ .Values.rabbitmq.persistence.storageClassName | quote }}
+{{- end }}

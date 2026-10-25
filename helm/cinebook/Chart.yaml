@@ -1,0 +1,6 @@
+apiVersion: v2
+name: cinebook
+description: CineBook API, frontend, PostgreSQL and RabbitMQ for Minikube
+type: application
+version: 0.1.0
+appVersion: "c70ebd7e524bfdfb6eb1263fb516e89fc43cd18f"

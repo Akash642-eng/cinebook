@@ -1,0 +1,66 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: cinebook-backend
+  labels:
+    app: cinebook-backend
+    app.kubernetes.io/part-of: cinebook
+spec:
+  type: ClusterIP
+  selector:
+    app: cinebook-backend
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cinebook-frontend
+  labels:
+    app: cinebook-frontend
+    app.kubernetes.io/part-of: cinebook
+spec:
+  type: ClusterIP
+  selector:
+    app: cinebook-frontend
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cinebook-postgres
+  labels:
+    app: cinebook-postgres
+    app.kubernetes.io/part-of: cinebook
+spec:
+  type: ClusterIP
+  selector:
+    app: cinebook-postgres
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: postgres
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cinebook-rabbitmq
+  labels:
+    app: cinebook-rabbitmq
+    app.kubernetes.io/part-of: cinebook
+spec:
+  type: ClusterIP
+  selector:
+    app: cinebook-rabbitmq
+  ports:
+    - name: amqp
+      port: 5672
+      targetPort: amqp
+    - name: management
+      port: 15672
+      targetPort: management

@@ -1,0 +1,69 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cinebook-postgres
+  labels:
+    app: cinebook-postgres
+    app.kubernetes.io/name: cinebook-postgres
+    app.kubernetes.io/part-of: cinebook
+spec:
+  replicas: {{ .Values.postgres.replicas }}
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: cinebook-postgres
+  template:
+    metadata:
+      labels:
+        app: cinebook-postgres
+        app.kubernetes.io/name: cinebook-postgres
+        app.kubernetes.io/part-of: cinebook
+    spec:
+      terminationGracePeriodSeconds: 60
+      containers:
+        - name: postgres
+          image: {{ .Values.postgres.image | quote }}
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: postgres
+              containerPort: {{ .Values.postgres.port }}
+          env:
+            - name: POSTGRES_DB
+              value: {{ .Values.postgres.database | quote }}
+            - name: POSTGRES_USER
+              value: {{ .Values.postgres.user | quote }}
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secretName }}
+                  key: POSTGRES_PASSWORD
+          resources:
+{{ toYaml .Values.postgres.resources | indent 12 }}
+          startupProbe:
+            exec:
+              command: ["sh", "-c", "pg_isready -U cinebook -d cinebook"]
+            periodSeconds: 5
+            timeoutSeconds: 5
+            failureThreshold: 36
+          readinessProbe:
+            exec:
+              command: ["sh", "-c", "pg_isready -U cinebook -d cinebook"]
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 5
+            failureThreshold: 6
+          livenessProbe:
+            exec:
+              command: ["sh", "-c", "pg_isready -U cinebook -d cinebook"]
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 6
+          volumeMounts:
+            - name: postgres-data
+              mountPath: /var/lib/postgresql/data
+      volumes:
+        - name: postgres-data
+          persistentVolumeClaim:
+            claimName: {{ .Values.postgres.persistence.existingClaim }}

@@ -1,0 +1,382 @@
+name: CineBook Phase 7 Hardening
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/phase7-validation.yml"
+      - "helm/cinebook/**"
+  workflow_dispatch:
+    inputs:
+      run_persistence_tests:
+        description: "Run database/queue persistence and actual image rollback tests (brief application interruption)"
+        required: true
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cinebook-phase7-hardening
+  cancel-in-progress: false
+
+jobs:
+  helm-validation:
+    name: Lint, render and scan Helm output
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.17.3
+
+      - name: Lint and render chart from clean checkout
+        shell: bash
+        run: |
+          set -euo pipefail
+          helm lint helm/cinebook
+          helm template cinebook helm/cinebook --namespace cinebook > "$RUNNER_TEMP/cinebook-rendered-existing-claims.yaml"
+          helm template cinebook helm/cinebook --namespace cinebook --set persistence.createClaims=true > "$RUNNER_TEMP/cinebook-rendered-new-claims.yaml"
+
+          for rendered in "$RUNNER_TEMP/cinebook-rendered-existing-claims.yaml" "$RUNNER_TEMP/cinebook-rendered-new-claims.yaml"; do
+            if grep -Eq '^kind:[[:space:]]*Secret[[:space:]]*$' "$rendered"; then
+              echo "::error::Rendered chart must reference external Secret keys, never create a Secret containing values."
+              exit 1
+            fi
+            grep -q 'secretKeyRef:' "$rendered"
+            test "$(grep -c 'startupProbe:' "$rendered")" -ge 4
+            test "$(grep -c 'readinessProbe:' "$rendered")" -ge 4
+            test "$(grep -c 'livenessProbe:' "$rendered")" -ge 4
+            grep -q 'cinebook-postgres-pvc' "$rendered"
+            grep -q 'cinebook-rabbitmq-pvc' "$rendered"
+          done
+
+          if grep -Eiq '(^|[[:space:]])(POSTGRES_PASSWORD|RABBITMQ_PASSWORD|JWT_SECRET)[[:space:]]*:[[:space:]]*[^#[:space:]]+' helm/cinebook/values.yaml; then
+            echo "::error::Possible literal secret value in chart values."
+            exit 1
+          fi
+          echo "PASS: clean-checkout Helm lint/render, all probes, PVC references and no Secret objects/values."
+
+  live-hardening:
+    name: Verify Minikube, persistence and rollback
+    runs-on: [self-hosted, Windows, X64]
+    needs: helm-validation
+    timeout-minutes: 35
+    env:
+      RUN_PERSISTENCE_TESTS: ${{ github.event_name == 'push' || inputs.run_persistence_tests }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Verify hardening and run controlled recovery tests
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $Namespace = "cinebook"
+          $PreviousTag = "746df1897d553ef170d180d7f676ef033da9b2e0"
+          $RunId = $env:GITHUB_RUN_ID
+          $BackupPath = Join-Path $env:RUNNER_TEMP "cinebook-db-backup-$RunId.sql"
+          $RestoreFileName = "phase7-restore-$RunId.sql"
+          $RestoreContainerPath = "/tmp/$RestoreFileName"
+          $RestoreDb = "phase7r$RunId"
+          $RestoreDbCreated = $false
+          $IngressPath = Join-Path $env:RUNNER_TEMP "cinebook-ingress-$RunId.yaml"
+          $RabbitQueue = "phase7-persistence-$RunId"
+          $RabbitQueueCreated = $false
+          $RabbitPassword = $null
+          $RabbitHeaders = $null
+          $RabbitBase = $null
+          $RabbitPort = 20000 + ([int]$RunId % 20000)
+          $RabbitForwardOut = Join-Path $env:RUNNER_TEMP "rabbit-port-forward-$RunId.out.log"
+          $RabbitForwardErr = Join-Path $env:RUNNER_TEMP "rabbit-port-forward-$RunId.err.log"
+          $CurrentBackend = $null
+          $CurrentFrontend = $null
+
+          function Get-TableCountFingerprint([string]$Database) {
+            $tables = & kubectl exec -n $Namespace deployment/cinebook-postgres -- psql -U cinebook -d $Database -At -v ON_ERROR_STOP=1 -c "SELECT tablename FROM pg_tables WHERE schemaname = 'public' ORDER BY tablename"
+            if ($LASTEXITCODE -ne 0) { throw "Could not list public tables in database '$Database'." }
+            $tableNames = @($tables | ForEach-Object { "$_".Trim() } | Where-Object { $_ })
+            if ($tableNames.Count -eq 0) { throw "No public tables found in database '$Database'." }
+            $counts = @()
+            foreach ($tableName in $tableNames) {
+              $quoted = $tableName.Replace('"','""')
+              $sql = 'SELECT COUNT(*) FROM public."' + $quoted + '"'
+              $count = & kubectl exec -n $Namespace deployment/cinebook-postgres -- psql -U cinebook -d $Database -At -v ON_ERROR_STOP=1 -c $sql
+              if ($LASTEXITCODE -ne 0) { throw "Could not count rows in '$Database' table '$tableName'." }
+              $counts += ($tableName + "=" + "$count".Trim())
+            }
+            return ($counts -join ";")
+          }
+
+          function Stop-RabbitForward {
+            if ($script:RabbitPortForward -and -not $script:RabbitPortForward.HasExited) {
+              Stop-Process -Id $script:RabbitPortForward.Id -Force -ErrorAction SilentlyContinue
+              $script:RabbitPortForward.WaitForExit()
+            }
+            $script:RabbitPortForward = $null
+          }
+
+          function Start-RabbitForward {
+            Stop-RabbitForward
+            $kubectlExe = (Get-Command kubectl.exe -ErrorAction Stop).Source
+            $argumentList = @("port-forward","-n",$Namespace,"deployment/cinebook-rabbitmq",($RabbitPort.ToString() + ":15672"),"--address=127.0.0.1")
+            $script:RabbitPortForward = Start-Process -FilePath $kubectlExe -ArgumentList $argumentList -PassThru -WindowStyle Hidden -RedirectStandardOutput $RabbitForwardOut -RedirectStandardError $RabbitForwardErr
+            for ($i = 0; $i -lt 30; $i++) {
+              if ($script:RabbitPortForward.HasExited) { break }
+              try {
+                $null = Invoke-RestMethod -Method Get -Uri ($RabbitBase + "/api/overview") -Headers $RabbitHeaders -TimeoutSec 3
+                return
+              } catch { Start-Sleep -Seconds 2 }
+            }
+            $portLog = ""
+            if (Test-Path $RabbitForwardErr) { $portLog = Get-Content $RabbitForwardErr -Raw }
+            throw "RabbitMQ management API did not start through port-forward. $portLog"
+          }
+
+          function Wait-PodReady([string]$LabelSelector, [int]$TimeoutSeconds = 240) {
+            $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+            while ((Get-Date) -lt $deadline) {
+              $podList = kubectl get pods -n $Namespace -l $LabelSelector -o json | ConvertFrom-Json
+              if ($LASTEXITCODE -ne 0) { throw "Could not list pods for selector '$LabelSelector'." }
+              foreach ($pod in $podList.items) {
+                $readyCondition = $pod.status.conditions | Where-Object { $_.type -eq "Ready" -and $_.status -eq "True" } | Select-Object -First 1
+                if ($pod.status.phase -eq "Running" -and $readyCondition) { return }
+              }
+              Start-Sleep -Seconds 3
+            }
+            kubectl get pods -n $Namespace -l $LabelSelector -o wide
+            throw "No Ready pod appeared for selector '$LabelSelector' within $TimeoutSeconds seconds."
+          }
+
+          function Test-IngressHealth {
+            $ip = (minikube ip).Trim()
+            if ($LASTEXITCODE -ne 0 -or -not $ip) { throw "Could not resolve Minikube IP." }
+            $body = & curl.exe --silent --show-error --fail --max-time 20 --header "Host: cinebook.local" "http://$ip/api/health"
+            if ($LASTEXITCODE -ne 0) { throw "Ingress health request failed for Host cinebook.local at Minikube IP $ip." }
+            $text = $body -join [Environment]::NewLine
+            if ($text -notmatch '"status"\s*:\s*"healthy"') { throw "Ingress returned an unexpected health response: $text" }
+            Write-Host "Ingress Host cinebook.local /api/health: PASS"
+          }
+
+          try {
+            $context = (kubectl config current-context).Trim()
+            if ($LASTEXITCODE -ne 0 -or $context -ne "minikube") { throw "Expected current Kubernetes context minikube; stopping." }
+            Write-Host "Context: $context; namespace: $Namespace; run: $RunId"
+
+            foreach ($deployment in @("cinebook-backend","cinebook-frontend","cinebook-postgres","cinebook-rabbitmq")) {
+              kubectl rollout status "deployment/$deployment" -n $Namespace --timeout=180s
+              if ($LASTEXITCODE -ne 0) { throw "Deployment $deployment is not rolled out." }
+            }
+
+            $CurrentBackend = (kubectl get deployment cinebook-backend -n $Namespace -o "jsonpath={.spec.template.spec.containers[?(@.name=='backend')].image}").Trim()
+            if ($LASTEXITCODE -ne 0 -or -not $CurrentBackend) { throw "Could not read current backend image." }
+            $CurrentFrontend = (kubectl get deployment cinebook-frontend -n $Namespace -o "jsonpath={.spec.template.spec.containers[?(@.name=='frontend')].image}").Trim()
+            if ($LASTEXITCODE -ne 0 -or -not $CurrentFrontend) { throw "Could not read current frontend image." }
+
+            $backendTag = [regex]::Match($CurrentBackend, ':([0-9a-f]{40})$').Groups[1].Value
+            $frontendTag = [regex]::Match($CurrentFrontend, ':([0-9a-f]{40})$').Groups[1].Value
+            if (-not $backendTag -or $backendTag -ne $frontendTag) { throw "Backend and frontend are not using the same full Git-SHA image tag." }
+            Write-Host "Backend/frontend share immutable SHA tag: $backendTag"
+
+            $frontendJson = kubectl get deployment cinebook-frontend -n $Namespace -o json | ConvertFrom-Json
+            $frontendContainer = $frontendJson.spec.template.spec.containers | Where-Object { $_.name -eq "frontend" } | Select-Object -First 1
+            if ($null -eq $frontendContainer.startupProbe) {
+              Write-Host "Adding missing frontend startup probe."
+              $patch = '{"spec":{"template":{"spec":{"containers":[{"name":"frontend","startupProbe":{"httpGet":{"path":"/","port":"http","scheme":"HTTP"},"periodSeconds":5,"timeoutSeconds":3,"failureThreshold":24}}]}}}}'
+              kubectl patch deployment cinebook-frontend -n $Namespace --type strategic --patch $patch
+              if ($LASTEXITCODE -ne 0) { throw "Could not patch frontend startup probe." }
+              kubectl rollout status deployment/cinebook-frontend -n $Namespace --timeout=180s
+              if ($LASTEXITCODE -ne 0) { throw "Frontend failed rollout after startup probe was added." }
+            }
+
+            $secretJson = kubectl get secret cinebook-secrets -n $Namespace -o json | ConvertFrom-Json
+            if ($LASTEXITCODE -ne 0) { throw "Required Kubernetes Secret cinebook-secrets is missing." }
+            $secretKeys = @($secretJson.data.PSObject.Properties | ForEach-Object { $_.Name })
+            foreach ($key in @("POSTGRES_PASSWORD","JWT_SECRET","RABBITMQ_PASSWORD")) {
+              if ($secretKeys -notcontains $key) { throw "Required Secret key '$key' is missing." }
+            }
+            Write-Host "Required Secret exists with expected key names; secret values were not printed."
+
+            $deployments = kubectl get deployments -n $Namespace -o json | ConvertFrom-Json
+            foreach ($d in $deployments.items) {
+              foreach ($c in $d.spec.template.spec.containers) {
+                foreach ($probeName in @("startupProbe","readinessProbe","livenessProbe")) {
+                  if ($null -eq $c.$probeName) { throw "Missing $probeName on deployment/$($d.metadata.name) container/$($c.name)." }
+                }
+                if (-not $c.resources.requests.cpu -or -not $c.resources.requests.memory -or -not $c.resources.limits.cpu -or -not $c.resources.limits.memory) {
+                  throw "Missing CPU/memory requests or limits on deployment/$($d.metadata.name) container/$($c.name)."
+                }
+              }
+            }
+            Write-Host "All live containers have startup/readiness/liveness probes and CPU/memory requests/limits."
+
+            $pvcs = kubectl get pvc -n $Namespace -o json | ConvertFrom-Json
+            foreach ($pvcName in @("cinebook-postgres-pvc","cinebook-rabbitmq-pvc")) {
+              $pvc = $pvcs.items | Where-Object { $_.metadata.name -eq $pvcName } | Select-Object -First 1
+              if ($null -eq $pvc -or $pvc.status.phase -ne "Bound") { throw "Expected PVC $pvcName to be Bound." }
+            }
+            Write-Host "PostgreSQL and RabbitMQ persistent claims remain Bound."
+
+            # Enable ingress and apply one Ingress only. No deployment or PVC is replaced here.
+            $ingressClass = kubectl get ingressclass nginx -o name 2>$null
+            if ($LASTEXITCODE -ne 0) {
+              minikube addons enable ingress
+              if ($LASTEXITCODE -ne 0) { throw "Could not enable the Minikube ingress addon." }
+            }
+            kubectl rollout status deployment/ingress-nginx-controller -n ingress-nginx --timeout=180s
+            if ($LASTEXITCODE -ne 0) { throw "NGINX ingress controller did not become available." }
+
+            $ingressYaml = @'
+          apiVersion: networking.k8s.io/v1
+          kind: Ingress
+          metadata:
+            name: cinebook
+            namespace: cinebook
+            labels:
+              app.kubernetes.io/part-of: cinebook
+          spec:
+            ingressClassName: nginx
+            rules:
+              - host: cinebook.local
+                http:
+                  paths:
+                    - path: /
+                      pathType: Prefix
+                      backend:
+                        service:
+                          name: cinebook-frontend
+                          port:
+                            number: 8080
+          '@
+            [System.IO.File]::WriteAllText($IngressPath, $ingressYaml, [System.Text.UTF8Encoding]::new($false))
+            kubectl apply -f $IngressPath
+            if ($LASTEXITCODE -ne 0) { throw "Could not apply the Ingress route." }
+            Start-Sleep -Seconds 8
+            Test-IngressHealth
+
+            if ($env:RUN_PERSISTENCE_TESTS -eq "true") {
+              Write-Host "=== POSTGRES BACKUP / RESTORE TO TEMP DATABASE ==="
+              $sourceFingerprint = Get-TableCountFingerprint -Database "cinebook"
+              $dumpLines = & kubectl exec -n $Namespace deployment/cinebook-postgres -- pg_dump -U cinebook -d cinebook --no-owner --no-privileges
+              if ($LASTEXITCODE -ne 0 -or -not $dumpLines) { throw "pg_dump failed; no restore or restart test performed." }
+              $dumpSql = [string]::Join([Environment]::NewLine, [string[]]$dumpLines) + [Environment]::NewLine
+              [System.IO.File]::WriteAllText($BackupPath, $dumpSql, [System.Text.UTF8Encoding]::new($false))
+              Write-Host "SQL backup created in temporary runner storage; bytes=$((Get-Item $BackupPath).Length). Contents are not printed."
+
+              kubectl exec -n $Namespace deployment/cinebook-postgres -- createdb -U cinebook $RestoreDb
+              if ($LASTEXITCODE -ne 0) { throw "Could not create the temporary restore database." }
+              $RestoreDbCreated = $true
+              $pgPod = (kubectl get pods -n $Namespace -l app=cinebook-postgres -o "jsonpath={.items[0].metadata.name}").Trim()
+              if ($LASTEXITCODE -ne 0 -or -not $pgPod) { throw "Could not locate PostgreSQL pod for restore." }
+              kubectl cp $BackupPath ($Namespace + "/" + $pgPod + ":" + $RestoreContainerPath)
+              if ($LASTEXITCODE -ne 0) { throw "Could not copy temporary SQL backup into PostgreSQL pod." }
+              kubectl exec -n $Namespace deployment/cinebook-postgres -- psql -U cinebook -d $RestoreDb -v ON_ERROR_STOP=1 -f $RestoreContainerPath
+              if ($LASTEXITCODE -ne 0) { throw "PostgreSQL restore into the temporary database failed." }
+              $restoredFingerprint = Get-TableCountFingerprint -Database $RestoreDb
+              if ($sourceFingerprint -ne $restoredFingerprint) { throw "Restored database table row counts differ from source." }
+              Write-Host "PASS: temporary PostgreSQL restore has matching table-by-table row counts."
+              kubectl exec -n $Namespace deployment/cinebook-postgres -- dropdb -U cinebook $RestoreDb
+              if ($LASTEXITCODE -ne 0) { throw "Could not drop temporary restore database after verification." }
+              $RestoreDbCreated = $false
+              kubectl exec -n $Namespace deployment/cinebook-postgres -- rm -f $RestoreContainerPath 2>$null
+
+              Write-Host "=== POSTGRES POD RESTART / PERSISTENCE ==="
+              $beforeDbRestart = Get-TableCountFingerprint -Database "cinebook"
+              $pgPod = (kubectl get pods -n $Namespace -l app=cinebook-postgres -o "jsonpath={.items[0].metadata.name}").Trim()
+              kubectl delete pod $pgPod -n $Namespace --wait=true --timeout=60s
+              if ($LASTEXITCODE -ne 0) { throw "Could not initiate PostgreSQL pod restart." }
+              Wait-PodReady -LabelSelector "app=cinebook-postgres" -TimeoutSeconds 240
+              kubectl exec -n $Namespace deployment/cinebook-postgres -- pg_isready -U cinebook -d cinebook
+              if ($LASTEXITCODE -ne 0) { throw "PostgreSQL readiness check failed after restart." }
+              $afterDbRestart = Get-TableCountFingerprint -Database "cinebook"
+              if ($beforeDbRestart -ne $afterDbRestart) { throw "PostgreSQL table row counts changed after pod restart." }
+              Write-Host "PASS: PostgreSQL recovered and its table-by-table row counts were unchanged."
+
+              Write-Host "=== RABBITMQ DURABLE MESSAGE / POD RESTART ==="
+              $secretJson = kubectl get secret cinebook-secrets -n $Namespace -o json | ConvertFrom-Json
+              $RabbitPassword = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String([string]$secretJson.data.RABBITMQ_PASSWORD))
+              $authBytes = [System.Text.Encoding]::UTF8.GetBytes("cinebook:" + $RabbitPassword)
+              $RabbitHeaders = @{ Authorization = "Basic " + [System.Convert]::ToBase64String($authBytes) }
+              $RabbitBase = "http://127.0.0.1:$RabbitPort"
+              Start-RabbitForward
+              $queueBody = @{ durable = $true; auto_delete = $false; arguments = @{} } | ConvertTo-Json -Depth 10
+              Invoke-RestMethod -Method Put -Uri ($RabbitBase + "/api/queues/%2F/" + $RabbitQueue) -Headers $RabbitHeaders -ContentType "application/json" -Body $queueBody -TimeoutSec 10 | Out-Null
+              $RabbitQueueCreated = $true
+              $marker = "cinebook-phase7-" + $RunId
+              $publishBody = @{ properties = @{ delivery_mode = 2 }; routing_key = $RabbitQueue; payload = $marker; payload_encoding = "string" } | ConvertTo-Json -Depth 10
+              $publishResult = Invoke-RestMethod -Method Post -Uri ($RabbitBase + "/api/exchanges/%2F/amq.default/publish") -Headers $RabbitHeaders -ContentType "application/json" -Body $publishBody -TimeoutSec 10
+              if (-not $publishResult.routed) { throw "RabbitMQ did not route the persistent test message." }
+              $queueState = Invoke-RestMethod -Method Get -Uri ($RabbitBase + "/api/queues/%2F/" + $RabbitQueue) -Headers $RabbitHeaders -TimeoutSec 10
+              if ($queueState.messages_ready -ne 1) { throw "RabbitMQ marker message was not ready before restart." }
+              Stop-RabbitForward
+
+              $rabbitPod = (kubectl get pods -n $Namespace -l app=cinebook-rabbitmq -o "jsonpath={.items[0].metadata.name}").Trim()
+              kubectl delete pod $rabbitPod -n $Namespace --wait=true --timeout=60s
+              if ($LASTEXITCODE -ne 0) { throw "Could not initiate RabbitMQ pod restart." }
+              Wait-PodReady -LabelSelector "app=cinebook-rabbitmq" -TimeoutSeconds 300
+              Start-RabbitForward
+              $queueState = Invoke-RestMethod -Method Get -Uri ($RabbitBase + "/api/queues/%2F/" + $RabbitQueue) -Headers $RabbitHeaders -TimeoutSec 10
+              if ($queueState.messages_ready -ne 1) { throw "RabbitMQ durable marker message did not survive pod restart." }
+              Write-Host "PASS: RabbitMQ recovered and one persistent marker message survived restart."
+              Invoke-RestMethod -Method Delete -Uri ($RabbitBase + "/api/queues/%2F/" + $RabbitQueue) -Headers $RabbitHeaders -TimeoutSec 10 | Out-Null
+              $RabbitQueueCreated = $false
+              Stop-RabbitForward
+            } else {
+              Write-Host "Skipped persistence tests because run_persistence_tests=false."
+            }
+
+            Write-Host "=== LIVE IMAGE ROLLBACK TO PREVIOUS WORKING SHA AND RESTORE ==="
+            $PreviousBackend = "ghcr.io/akash642-eng/cinebook-backend:$PreviousTag"
+            $PreviousFrontend = "ghcr.io/akash642-eng/cinebook-frontend:$PreviousTag"
+            docker manifest inspect $PreviousBackend *> $null
+            if ($LASTEXITCODE -ne 0) { throw "Previous backend image unavailable; cannot run live rollback test." }
+            docker manifest inspect $PreviousFrontend *> $null
+            if ($LASTEXITCODE -ne 0) { throw "Previous frontend image unavailable; cannot run live rollback test." }
+            try {
+              kubectl set image deployment/cinebook-backend ("backend=" + $PreviousBackend) -n $Namespace
+              if ($LASTEXITCODE -ne 0) { throw "Could not switch backend to previous known-good image." }
+              kubectl rollout status deployment/cinebook-backend -n $Namespace --timeout=180s
+              if ($LASTEXITCODE -ne 0) { throw "Backend rollout to previous image failed." }
+              kubectl set image deployment/cinebook-frontend ("frontend=" + $PreviousFrontend) -n $Namespace
+              if ($LASTEXITCODE -ne 0) { throw "Could not switch frontend to previous known-good image." }
+              kubectl rollout status deployment/cinebook-frontend -n $Namespace --timeout=180s
+              if ($LASTEXITCODE -ne 0) { throw "Frontend rollout to previous image failed." }
+              Test-IngressHealth
+              Write-Host "PASS: previous working CineBook backend/frontend SHA was healthy through Ingress."
+            } finally {
+              Write-Host "Restoring the exact images active before the rollback test."
+              kubectl set image deployment/cinebook-backend ("backend=" + $CurrentBackend) -n $Namespace
+              if ($LASTEXITCODE -ne 0) { throw "CRITICAL: could not restore original backend image $CurrentBackend." }
+              kubectl set image deployment/cinebook-frontend ("frontend=" + $CurrentFrontend) -n $Namespace
+              if ($LASTEXITCODE -ne 0) { throw "CRITICAL: could not restore original frontend image $CurrentFrontend." }
+              kubectl rollout status deployment/cinebook-backend -n $Namespace --timeout=180s
+              if ($LASTEXITCODE -ne 0) { throw "CRITICAL: original backend image did not recover." }
+              kubectl rollout status deployment/cinebook-frontend -n $Namespace --timeout=180s
+              if ($LASTEXITCODE -ne 0) { throw "CRITICAL: original frontend image did not recover." }
+              Test-IngressHealth
+              Write-Host "PASS: original application image pair restored."
+            }
+
+            Write-Host "PHASE 7 LIVE HARDENING: PASS"
+          } finally {
+            Stop-RabbitForward
+            if ($RabbitQueueCreated -and $RabbitHeaders -and $RabbitBase) {
+              try {
+                Start-RabbitForward
+                Invoke-RestMethod -Method Delete -Uri ($RabbitBase + "/api/queues/%2F/" + $RabbitQueue) -Headers $RabbitHeaders -TimeoutSec 10 | Out-Null
+                $RabbitQueueCreated = $false
+              } catch { Write-Warning "RabbitMQ test queue cleanup may need checking: $RabbitQueue" }
+              Stop-RabbitForward
+            }
+            if ($RestoreDbCreated) {
+              try { kubectl exec -n $Namespace deployment/cinebook-postgres -- dropdb -U cinebook $RestoreDb } catch { Write-Warning "Temporary restore DB cleanup may need checking: $RestoreDb" }
+            }
+            if (Test-Path $BackupPath) { Remove-Item $BackupPath -Force -ErrorAction SilentlyContinue }
+            if (Test-Path $IngressPath) { Remove-Item $IngressPath -Force -ErrorAction SilentlyContinue }
+            $RabbitPassword = $null
+          }

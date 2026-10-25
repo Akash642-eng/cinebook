@@ -1,0 +1,69 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cinebook-rabbitmq
+  labels:
+    app: cinebook-rabbitmq
+    app.kubernetes.io/name: cinebook-rabbitmq
+    app.kubernetes.io/part-of: cinebook
+spec:
+  replicas: {{ .Values.rabbitmq.replicas }}
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: cinebook-rabbitmq
+  template:
+    metadata:
+      labels:
+        app: cinebook-rabbitmq
+        app.kubernetes.io/name: cinebook-rabbitmq
+        app.kubernetes.io/part-of: cinebook
+    spec:
+      terminationGracePeriodSeconds: 60
+      containers:
+        - name: rabbitmq
+          image: {{ .Values.rabbitmq.image | quote }}
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: amqp
+              containerPort: {{ .Values.rabbitmq.port }}
+            - name: management
+              containerPort: {{ .Values.rabbitmq.managementPort }}
+          env:
+            - name: RABBITMQ_DEFAULT_USER
+              value: {{ .Values.rabbitmq.user | quote }}
+            - name: RABBITMQ_DEFAULT_PASS
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secretName }}
+                  key: RABBITMQ_PASSWORD
+          resources:
+{{ toYaml .Values.rabbitmq.resources | indent 12 }}
+          startupProbe:
+            exec:
+              command: ["rabbitmq-diagnostics", "-q", "ping"]
+            periodSeconds: 10
+            timeoutSeconds: 10
+            failureThreshold: 36
+          readinessProbe:
+            exec:
+              command: ["rabbitmq-diagnostics", "-q", "ping"]
+            initialDelaySeconds: 20
+            periodSeconds: 10
+            timeoutSeconds: 10
+            failureThreshold: 6
+          livenessProbe:
+            exec:
+              command: ["rabbitmq-diagnostics", "-q", "ping"]
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            timeoutSeconds: 10
+            failureThreshold: 6
+          volumeMounts:
+            - name: rabbitmq-data
+              mountPath: /var/lib/rabbitmq
+      volumes:
+        - name: rabbitmq-data
+          persistentVolumeClaim:
+            claimName: {{ .Values.rabbitmq.persistence.existingClaim }}
