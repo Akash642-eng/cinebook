@@ -39,7 +39,7 @@ jobs:
         run: terraform fmt -diff -check -recursive
 
       - name: Initialize without remote backend
-        run: terraform init -backend=false -input=false
+        run: terraform init -backend=false -input=false -lockfile=readonly
 
       - name: Validate Terraform configuration
         run: terraform validate
