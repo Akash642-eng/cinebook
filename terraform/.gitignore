@@ -1,0 +1,9 @@
+# Terraform local state, caches, plans and generated outputs
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+phase8-plan.txt
+crash.log
+dev.tfvars
+*.auto.tfvars

@@ -1,0 +1,72 @@
+name: CineBook Terraform CI
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "terraform/**"
+      - ".github/workflows/terraform-ci.yml"
+  pull_request:
+    branches:
+      - main
+    paths:
+      - "terraform/**"
+      - ".github/workflows/terraform-ci.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  terraform-review:
+    name: Format, validate and offline-plan AWS foundation
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: terraform
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.13.5"
+          terraform_wrapper: false
+
+      - name: Check Terraform formatting
+        run: terraform fmt -check -recursive
+
+      - name: Initialize without remote backend
+        run: terraform init -backend=false -input=false
+
+      - name: Validate Terraform configuration
+        run: terraform validate
+
+      - name: Create offline review plan (no AWS credentials and no apply)
+        shell: bash
+        run: |
+          set -euo pipefail
+          terraform plan \
+            -refresh=false \
+            -input=false \
+            -var="enable_infrastructure=true" \
+            -var="offline_plan_validation=true" \
+            -out=phase8-plan.tfplan
+
+          terraform show -no-color phase8-plan.tfplan > phase8-plan.txt
+          grep -Eq 'Plan: [1-9][0-9]* to add, 0 to change, 0 to destroy\.' phase8-plan.txt
+          if grep -Eiq 'aws_(nat_gateway|lb|ecs_service|eks_cluster|db_instance|mq_broker)\.' phase8-plan.txt; then
+            echo "::error::A recurring-cost workload unexpectedly appeared in the foundation plan."
+            exit 1
+          fi
+          echo "PASS: foundation plan contains creates only; no changes/destroys and no NAT/ALB/compute/RDS/Amazon MQ."
+
+      - name: Upload human-readable plan for review
+        uses: actions/upload-artifact@v4
+        with:
+          name: cinebook-phase8-terraform-plan
+          path: terraform/phase8-plan.txt
+          if-no-files-found: error
+          retention-days: 7
