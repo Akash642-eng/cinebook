@@ -1,0 +1,170 @@
+name: CineBook Rollback Recovery Test
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/rollback-test.yml
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "Full 40-character commit SHA of images already published to GHCR"
+        required: false
+        default: c70ebd7e524bfdfb6eb1263fb516e89fc43cd18f
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cinebook-rollback-test
+  cancel-in-progress: false
+
+jobs:
+  rollback-test:
+    name: Test failed rollout and image restoration
+    runs-on: [self-hosted, Windows, X64]
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Simulate unhealthy rollout in an isolated namespace and restore the working image
+        shell: powershell
+        env:
+          IMAGE_TAG: ${{ inputs.image_tag }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $ImageTag = [string]$env:IMAGE_TAG
+          if ([string]::IsNullOrWhiteSpace($ImageTag)) {
+            $ImageTag = "c70ebd7e524bfdfb6eb1263fb516e89fc43cd18f"
+          }
+          $ImageTag = $ImageTag.Trim()
+
+          if ($ImageTag -notmatch '^[0-9a-f]{40}$') {
+            throw "Provide the full 40-character lowercase SHA for published GHCR images."
+          }
+
+          $Context = kubectl config current-context
+          if ($LASTEXITCODE -ne 0 -or $Context.Trim() -ne "minikube") {
+            throw "Expected Kubernetes context minikube. No test resources created."
+          }
+
+          $BackendImage = "ghcr.io/akash642-eng/cinebook-backend:$ImageTag"
+          $FrontendImage = "ghcr.io/akash642-eng/cinebook-frontend:$ImageTag"
+
+          foreach ($Image in @($BackendImage, $FrontendImage)) {
+            docker manifest inspect $Image *> $null
+            if ($LASTEXITCODE -ne 0) {
+              throw "Published test image not found in GHCR: $Image"
+            }
+          }
+
+          $Namespace = "cinebook-rollback-test-$env:GITHUB_RUN_ID"
+          $ManifestPath = Join-Path $env:RUNNER_TEMP "rollback-probe-$env:GITHUB_RUN_ID.json"
+          $NamespaceCreated = $false
+
+          try {
+            kubectl create namespace $Namespace
+            if ($LASTEXITCODE -ne 0) { throw "Could not create isolated rollback-test namespace." }
+            $NamespaceCreated = $true
+
+            $Manifest = @{
+              apiVersion = "apps/v1"
+              kind = "Deployment"
+              metadata = @{
+                name = "rollback-probe"
+                namespace = $Namespace
+                labels = @{ app = "rollback-probe"; purpose = "cinebook-rollback-test" }
+              }
+              spec = @{
+                replicas = 1
+                selector = @{ matchLabels = @{ app = "rollback-probe" } }
+                template = @{
+                  metadata = @{ labels = @{ app = "rollback-probe" } }
+                  spec = @{
+                    containers = @(@{
+                      name = "probe"
+                      image = $FrontendImage
+                      imagePullPolicy = "IfNotPresent"
+                      ports = @(@{ containerPort = 8080 })
+                      readinessProbe = @{
+                        httpGet = @{ path = "/"; port = 8080 }
+                        initialDelaySeconds = 2
+                        periodSeconds = 2
+                        timeoutSeconds = 2
+                        failureThreshold = 2
+                      }
+                    })
+                  }
+                }
+              }
+            }
+
+            [System.IO.File]::WriteAllText(
+              $ManifestPath,
+              ($Manifest | ConvertTo-Json -Depth 20),
+              [System.Text.UTF8Encoding]::new($false)
+            )
+
+            kubectl apply -f $ManifestPath
+            if ($LASTEXITCODE -ne 0) { throw "Could not create baseline probe deployment." }
+
+            kubectl rollout status deployment/rollback-probe -n $Namespace --timeout=120s
+            if ($LASTEXITCODE -ne 0) { throw "Baseline frontend probe did not become healthy; rollback test cannot continue." }
+
+            $OldImage = kubectl get deployment rollback-probe -n $Namespace -o "jsonpath={.spec.template.spec.containers[?(@.name=='probe')].image}"
+            if ($LASTEXITCODE -ne 0 -or $OldImage.Trim() -ne $FrontendImage) {
+              throw "Could not verify the original healthy image."
+            }
+            Write-Host "Baseline is healthy. Saved image for rollback: $OldImage"
+
+            # The backend image listens on 8000, while this isolated probe checks 8080.
+            # This intentionally creates an unhealthy rollout only in the test namespace.
+            kubectl set image deployment/rollback-probe "probe=$BackendImage" -n $Namespace
+            if ($LASTEXITCODE -ne 0) { throw "Could not apply the intentional test image." }
+
+            kubectl rollout status deployment/rollback-probe -n $Namespace --timeout=30s
+            $UnhealthyRolloutExit = $LASTEXITCODE
+            if ($UnhealthyRolloutExit -eq 0) {
+              throw "The intentionally incompatible image became healthy; the test did not exercise rollback."
+            }
+
+            $AppliedImage = kubectl get deployment rollback-probe -n $Namespace -o "jsonpath={.spec.template.spec.containers[?(@.name=='probe')].image}"
+            if ($LASTEXITCODE -ne 0 -or $AppliedImage.Trim() -ne $BackendImage) {
+              throw "Could not confirm the intended test image was applied."
+            }
+
+            Write-Host "Expected unhealthy rollout observed. Restoring the original healthy image."
+            kubectl get pods -n $Namespace -o wide
+
+            # Exercise the same image-restoration action used by deploy.yml's recovery path.
+            kubectl set image deployment/rollback-probe "probe=$OldImage" -n $Namespace
+            if ($LASTEXITCODE -ne 0) { throw "Rollback command failed to restore the previous image." }
+
+            kubectl rollout status deployment/rollback-probe -n $Namespace --timeout=120s
+            if ($LASTEXITCODE -ne 0) { throw "Restored image did not become healthy." }
+
+            $RestoredImage = kubectl get deployment rollback-probe -n $Namespace -o "jsonpath={.spec.template.spec.containers[?(@.name=='probe')].image}"
+            $AvailableReplicas = kubectl get deployment rollback-probe -n $Namespace -o "jsonpath={.status.availableReplicas}"
+            if ($LASTEXITCODE -ne 0 -or $RestoredImage.Trim() -ne $OldImage.Trim() -or $AvailableReplicas.Trim() -ne "1") {
+              throw "Rollback verification failed: image or available replica count did not return to baseline."
+            }
+
+            Write-Host "PASS: unhealthy rollout detected, original image restored, and one replica became available."
+            kubectl get deployment rollback-probe -n $Namespace
+          }
+          finally {
+            if (Test-Path $ManifestPath) { Remove-Item $ManifestPath -Force -ErrorAction SilentlyContinue }
+            if ($NamespaceCreated) {
+              kubectl delete namespace $Namespace --wait=true --timeout=120s
+              if ($LASTEXITCODE -ne 0) {
+                Write-Warning "Could not clean up $Namespace automatically. Check the namespace and delete it only after confirming it is the rollback-test namespace."
+              } else {
+                Write-Host "Cleaned up isolated namespace $Namespace."
+              }
+            }
+          }
