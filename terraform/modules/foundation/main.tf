@@ -13,7 +13,7 @@ locals {
     "ecr:DescribeRepositories",
     "ecr:InitiateLayerUpload",
     "ecr:PutImage",
-    "ecr:UploadLayerPart"
+    "ecr:UploadLayerPart",
   ]
 }
 
@@ -261,13 +261,13 @@ resource "aws_iam_role" "github_ecr_publisher" {
   name = "${var.name_prefix}-github-ecr-publisher"
 
   assume_role_policy = jsonencode({
-    Version = "2012-10-17"
+    Version   = "2012-10-17"
     Statement = [{
-      Effect = "Allow"
+      Effect    = "Allow"
       Principal = {
         Federated = var.github_oidc_provider_arn
       }
-      Action = "sts:AssumeRoleWithWebIdentity"
+      Action    = "sts:AssumeRoleWithWebIdentity"
       Condition = {
         StringEquals = {
           "token.actions.githubusercontent.com:aud" = "sts.amazonaws.com"
