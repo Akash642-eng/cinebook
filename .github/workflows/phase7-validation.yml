@@ -91,7 +91,7 @@ jobs:
           $RabbitPassword = $null
           $RabbitHeaders = $null
           $RabbitBase = $null
-          $RabbitPort = 20000 + ([int]$RunId % 20000)
+          $RabbitPort = 25000 + ([long]$RunId % 10000)
           $RabbitForwardOut = Join-Path $env:RUNNER_TEMP "rabbit-port-forward-$RunId.out.log"
           $RabbitForwardErr = Join-Path $env:RUNNER_TEMP "rabbit-port-forward-$RunId.err.log"
           $CurrentBackend = $null
