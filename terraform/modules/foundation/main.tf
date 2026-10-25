@@ -295,7 +295,7 @@ resource "aws_iam_role_policy" "github_ecr_publish" {
     Statement = [
       {
         Sid      = "GetEcrLoginToken"
-        Effect = "Allow"
+        Effect   = "Allow"
         Action   = ["ecr:GetAuthorizationToken"]
         Resource = "*"
       },
