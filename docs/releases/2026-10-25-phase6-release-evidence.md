@@ -34,10 +34,11 @@ Trivy gate configuration: scan OS and library vulnerabilities at HIGH/CRITICAL s
 
 ## Rollback test evidence
 
-The isolated rollback-recovery workflow is introduced alongside this record. It creates a unique temporary namespace, starts a healthy frontend probe deployment, switches only that probe to the incompatible backend image to force an unhealthy rollout, restores the original image, verifies one available replica, and deletes the test namespace. It does not change the live `cinebook` namespace.
+The isolated rollback-recovery test creates a unique temporary namespace, starts a healthy frontend probe deployment, switches only that probe to the backend image to force an unhealthy rollout, restores the original frontend image, verifies one available replica, and deletes the temporary namespace. It does not modify the live `cinebook` namespace or persistent data.
 
-- Rollback test run: to be recorded after the first run of [CineBook Rollback Recovery Test](https://github.com/Akash642-eng/cinebook/actions/workflows/rollback-test.yml).
-- Outcome: pending at initial creation of this record; this file will be updated with the observed run result after the test completes.
+- Rollback test run: [CineBook Rollback Recovery Test](https://github.com/Akash642-eng/cinebook/actions/runs/40187774563) — **success**
+- Observed sequence: healthy baseline confirmed; backend-image rollout timed out as expected; original frontend image restored; one available replica verified; temporary namespace cleaned up.
+- Outcome: **PASS** for the isolated image-restoration/rollback procedure. This simulates the failed-rollout recovery action without deliberately changing the live application's images.
 
 ## Scope and limitations
 
