@@ -93,6 +93,10 @@ jobs:
           $RabbitHeaders = $null
           $RabbitBase = $null
           $RabbitPort = 25000 + ([long]$RunId % 10000)
+          $IngressPort = 42000 + ([long]$RunId % 10000)
+          $IngressForwardOut = Join-Path $env:RUNNER_TEMP "ingress-port-forward-$RunId.out.log"
+          $IngressForwardErr = Join-Path $env:RUNNER_TEMP "ingress-port-forward-$RunId.err.log"
+          $IngressPortForward = $null
           $RabbitForwardOut = Join-Path $env:RUNNER_TEMP "rabbit-port-forward-$RunId.out.log"
           $RabbitForwardErr = Join-Path $env:RUNNER_TEMP "rabbit-port-forward-$RunId.err.log"
           $CurrentBackend = $null
@@ -154,14 +158,40 @@ jobs:
             throw "No Ready pod appeared for selector '$LabelSelector' within $TimeoutSeconds seconds."
           }
 
+          function Stop-IngressForward {
+            if ($script:IngressPortForward -and -not $script:IngressPortForward.HasExited) {
+              Stop-Process -Id $script:IngressPortForward.Id -Force -ErrorAction SilentlyContinue
+              $script:IngressPortForward.WaitForExit()
+            }
+            $script:IngressPortForward = $null
+          }
+
           function Test-IngressHealth {
-            $ip = (minikube ip).Trim()
-            if ($LASTEXITCODE -ne 0 -or -not $ip) { throw "Could not resolve Minikube IP." }
-            $body = & curl.exe --silent --show-error --fail --max-time 20 --header "Host: cinebook.local" "http://$ip/api/health"
-            if ($LASTEXITCODE -ne 0) { throw "Ingress health request failed for Host cinebook.local at Minikube IP $ip." }
-            $text = $body -join [Environment]::NewLine
-            if ($text -notmatch '"status"\s*:\s*"healthy"') { throw "Ingress returned an unexpected health response: $text" }
-            Write-Host "Ingress Host cinebook.local /api/health: PASS"
+            try {
+              Stop-IngressForward
+              $kubectlExe = (Get-Command kubectl.exe -ErrorAction Stop).Source
+              $arguments = @("port-forward","-n","ingress-nginx","deployment/ingress-nginx-controller",($IngressPort.ToString() + ":80"),"--address=127.0.0.1")
+              $script:IngressPortForward = Start-Process -FilePath $kubectlExe -ArgumentList $arguments -PassThru -WindowStyle Hidden -RedirectStandardOutput $IngressForwardOut -RedirectStandardError $IngressForwardErr
+              for ($i = 0; $i -lt 30; $i++) {
+                if ($script:IngressPortForward.HasExited) { break }
+                $body = & curl.exe --silent --show-error --fail --max-time 5 --header "Host: cinebook.local" "http://127.0.0.1:$IngressPort/api/health"
+                if ($LASTEXITCODE -eq 0) {
+                  $responseText = $body -join [Environment]::NewLine
+                  if ($responseText -match '"status"\s*:\s*"healthy"') {
+                    Write-Host "Ingress Host cinebook.local /api/health via local port-forward: PASS"
+                    return
+                  }
+                }
+                Start-Sleep -Seconds 2
+              }
+              $portLog = ""
+              if (Test-Path $IngressForwardErr) { $portLog = Get-Content $IngressForwardErr -Raw }
+              kubectl get ingress cinebook -n $Namespace -o wide
+              kubectl get pods -n ingress-nginx -o wide
+              throw "Ingress host routing health check failed through local port-forward. $portLog"
+            } finally {
+              Stop-IngressForward
+            }
           }
 
           try {
@@ -382,6 +412,7 @@ jobs:
 
             Write-Host "PHASE 7 LIVE HARDENING: PASS"
           } finally {
+            Stop-IngressForward
             Stop-RabbitForward
             if ($RabbitQueueCreated -and $RabbitHeaders -and $RabbitBase) {
               try {
