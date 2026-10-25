@@ -319,11 +319,10 @@ jobs:
               kubectl exec -n $Namespace deployment/cinebook-postgres -- createdb -U cinebook $RestoreDb
               if ($LASTEXITCODE -ne 0) { throw "Could not create the temporary restore database." }
               $RestoreDbCreated = $true
-              $pgPod = (kubectl get pods -n $Namespace -l app=cinebook-postgres -o "jsonpath={.items[0].metadata.name}").Trim()
-              if ($LASTEXITCODE -ne 0 -or -not $pgPod) { throw "Could not locate PostgreSQL pod for restore." }
-              kubectl cp $BackupPath ($Namespace + "/" + $pgPod + ":" + $RestoreContainerPath)
-              if ($LASTEXITCODE -ne 0) { throw "Could not copy temporary SQL backup into PostgreSQL pod." }
-              kubectl exec -n $Namespace deployment/cinebook-postgres -- psql -U cinebook -d $RestoreDb -v ON_ERROR_STOP=1 -f $RestoreContainerPath
+              # Stream a base64 representation through kubectl exec: this is safe for Windows
+              # paths and preserves UTF-8 SQL without using kubectl cp's Windows drive syntax.
+              $backupBase64 = [System.Convert]::ToBase64String([System.IO.File]::ReadAllBytes($BackupPath))
+              $backupBase64 | & kubectl exec -i -n $Namespace deployment/cinebook-postgres -- sh -c ("base64 -d | psql -U cinebook -d " + $RestoreDb + " -v ON_ERROR_STOP=1")
               if ($LASTEXITCODE -ne 0) { throw "PostgreSQL restore into the temporary database failed." }
               $restoredFingerprint = Get-TableCountFingerprint -Database $RestoreDb
               if ($sourceFingerprint -ne $restoredFingerprint) { throw "Restored database table row counts differ from source." }
@@ -331,7 +330,6 @@ jobs:
               kubectl exec -n $Namespace deployment/cinebook-postgres -- dropdb -U cinebook $RestoreDb
               if ($LASTEXITCODE -ne 0) { throw "Could not drop temporary restore database after verification." }
               $RestoreDbCreated = $false
-              kubectl exec -n $Namespace deployment/cinebook-postgres -- rm -f $RestoreContainerPath 2>$null
 
               Write-Host "=== POSTGRES POD RESTART / PERSISTENCE ==="
               $beforeDbRestart = Get-TableCountFingerprint -Database "cinebook"
