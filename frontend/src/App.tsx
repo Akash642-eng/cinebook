@@ -1,3 +1,4 @@
+/* eslint-disable react-hooks/set-state-in-effect -- Effects initiate API requests; their loading-state updates are intentional. */
 import { useCallback, useEffect, useMemo, useState, type FormEvent } from "react";
 import { BrowserRouter, Link, NavLink, Route, Routes, useNavigate, useParams } from "react-router-dom";
 import "./App.css";
@@ -11,7 +12,7 @@ type Booking = { id:number; user_id:number; showtime_id:number; seat_number:numb
 type Payment = { id:number; booking_id:number; amount_rupees:string; currency:string; provider:string; status:"succeeded"|"failed"; reference:string; created_at:string };
 type Ticket = { id:number; booking_id:number; status:string; movie_title:string; showtime_id:number; starts_at:string; seat_number:number; created_at:string; verification_url:string; qr_url:string; pdf_url:string };
 const TOKEN_KEY="cinebook_access_token";
-async function api<T>(path:string, init:RequestInit={}, token?:string):Promise<T>{ const headers=new Headers(init.headers); if(init.body) headers.set("Content-Type","application/json"); if(token) headers.set("Authorization",`Bearer ${token}`); const r=await fetch(path,{...init,headers}); if(!r.ok){let msg=`Request failed (${r.status})`; try{const b=await r.json(); if(typeof b.detail==="string")msg=b.detail;}catch{} throw new Error(msg);} return r.json() as Promise<T>; }
+async function api<T>(path:string, init:RequestInit={}, token?:string):Promise<T>{ const headers=new Headers(init.headers); if(init.body) headers.set("Content-Type","application/json"); if(token) headers.set("Authorization",`Bearer ${token}`); const r=await fetch(path,{...init,headers}); if(!r.ok){let msg=`Request failed (${r.status})`; try{const b=await r.json(); if(typeof b.detail==="string")msg=b.detail;}catch { /* Ignore non-JSON error bodies; retain the HTTP fallback message. */ } throw new Error(msg);} return r.json() as Promise<T>; }
 const money=(p:number)=>new Intl.NumberFormat("en-IN",{style:"currency",currency:"INR",maximumFractionDigits:0}).format(p/100);
 const date=(v:string)=>new Intl.DateTimeFormat("en-IN",{dateStyle:"medium",timeStyle:"short",timeZone:"Asia/Kolkata"}).format(new Date(v));
 function Spinner({label="Loading CineBook"}:{label?:string}){return <div className="loading-state"><span className="spinner"/><span>{label}</span></div>}
