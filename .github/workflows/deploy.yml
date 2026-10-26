@@ -1,4 +1,5 @@
-﻿name: Deploy CineBook to Minikube
+﻿
+name: Deploy CineBook to Minikube
 
 on:
   workflow_dispatch:
@@ -36,6 +37,7 @@ jobs:
           $ImageTag = [string]$env:IMAGE_TAG
           if ($null -eq $ImageTag) { $ImageTag = "" }
           $ImageTag = $ImageTag.Trim().Trim('"').Trim("'")
+
           Write-Host "Image tag length received: $($ImageTag.Length)"
 
           if ($ImageTag -notmatch '^[0-9a-f]{40}$') {
@@ -53,17 +55,24 @@ jobs:
 
           foreach ($Image in @($BackendImage, $FrontendImage)) {
             docker manifest inspect $Image *> $null
+
             if ($LASTEXITCODE -ne 0) {
-              throw "Image not found in GHCR: $Image. No deployment performed."
+              throw "Image not found or inaccessible in GHCR: $Image. No deployment performed."
             }
           }
 
-          $OldBackend = kubectl get deployment cinebook-backend -n $Namespace -o "jsonpath={.spec.template.spec.containers[?(@.name=='backend')].image}"
+          $OldBackend = kubectl get deployment cinebook-backend `
+            -n $Namespace `
+            -o "jsonpath={.spec.template.spec.containers[?(@.name=='backend')].image}"
+
           if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($OldBackend)) {
             throw "Could not read current backend image."
           }
 
-          $OldFrontend = kubectl get deployment cinebook-frontend -n $Namespace -o "jsonpath={.spec.template.spec.containers[?(@.name=='frontend')].image}"
+          $OldFrontend = kubectl get deployment cinebook-frontend `
+            -n $Namespace `
+            -o "jsonpath={.spec.template.spec.containers[?(@.name=='frontend')].image}"
+
           if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($OldFrontend)) {
             throw "Could not read current frontend image."
           }
@@ -72,35 +81,127 @@ jobs:
           Write-Host "Previous frontend image: $OldFrontend"
           Write-Host "Deploying tag: $ImageTag"
 
+          $ImagesChanged = $false
+
           try {
-            kubectl set image deployment/cinebook-backend "backend=$BackendImage" -n $Namespace
-            if ($LASTEXITCODE -ne 0) { throw "Failed to update backend image." }
+            # Apply the database migration before deploying application images.
+            Write-Host "Applying payment idempotency migration..."
 
-            kubectl set image deployment/cinebook-frontend "frontend=$FrontendImage" -n $Namespace
-            if ($LASTEXITCODE -ne 0) { throw "Failed to update frontend image." }
+            $MigrationPath = Join-Path `
+              $env:GITHUB_WORKSPACE `
+              "backend/migrations/day6_payment_idempotency.sql"
 
-            kubectl rollout status deployment/cinebook-backend -n $Namespace --timeout=180s
-            if ($LASTEXITCODE -ne 0) { throw "Backend rollout failed." }
+            if (-not (Test-Path -LiteralPath $MigrationPath -PathType Leaf)) {
+              throw "Migration file not found: $MigrationPath"
+            }
 
-            kubectl rollout status deployment/cinebook-frontend -n $Namespace --timeout=180s
-            if ($LASTEXITCODE -ne 0) { throw "Frontend rollout failed." }
+            $MigrationSql = Get-Content -LiteralPath $MigrationPath -Raw
 
+            if ([string]::IsNullOrWhiteSpace($MigrationSql)) {
+              throw "Migration file is empty."
+            }
+
+            $MigrationSql |
+              kubectl exec -i -n $Namespace deployment/cinebook-postgres -- `
+                psql -v ON_ERROR_STOP=1 -U cinebook -d cinebook
+
+            if ($LASTEXITCODE -ne 0) {
+              throw "Database migration failed. Application images were not updated."
+            }
+
+            Write-Host "Database migration completed successfully."
+
+            # Deploy the backend image.
+            kubectl set image deployment/cinebook-backend `
+              "backend=$BackendImage" -n $Namespace
+
+            if ($LASTEXITCODE -ne 0) {
+              throw "Failed to update backend image."
+            }
+
+            $ImagesChanged = $true
+
+            # Deploy the frontend image.
+            kubectl set image deployment/cinebook-frontend `
+              "frontend=$FrontendImage" -n $Namespace
+
+            if ($LASTEXITCODE -ne 0) {
+              throw "Failed to update frontend image."
+            }
+
+            # Wait for both application rollouts.
+            kubectl rollout status deployment/cinebook-backend `
+              -n $Namespace --timeout=180s
+
+            if ($LASTEXITCODE -ne 0) {
+              throw "Backend rollout failed."
+            }
+
+            kubectl rollout status deployment/cinebook-frontend `
+              -n $Namespace --timeout=180s
+
+            if ($LASTEXITCODE -ne 0) {
+              throw "Frontend rollout failed."
+            }
+
+            # Verify running pods and backend endpoints.
             kubectl get pods -n $Namespace
-            if ($LASTEXITCODE -ne 0) { throw "Could not verify CineBook pods." }
+
+            if ($LASTEXITCODE -ne 0) {
+              throw "Could not verify CineBook pods."
+            }
 
             kubectl get endpoints cinebook-backend -n $Namespace
-            if ($LASTEXITCODE -ne 0) { throw "Could not verify backend endpoints." }
 
-            Write-Host "Deployment and rollout checks succeeded."
+            if ($LASTEXITCODE -ne 0) {
+              throw "Could not verify backend endpoints."
+            }
+
+            Write-Host "Deployment and rollout checks succeeded." -ForegroundColor Green
           }
           catch {
-            Write-Host "Deployment failed. Restoring previous application images." -ForegroundColor Yellow
+            $DeploymentError = $_
 
-            kubectl set image deployment/cinebook-backend "backend=$OldBackend" -n $Namespace
-            kubectl set image deployment/cinebook-frontend "frontend=$OldFrontend" -n $Namespace
+            Write-Host "Deployment failed: $DeploymentError" -ForegroundColor Red
 
-            kubectl rollout status deployment/cinebook-backend -n $Namespace --timeout=180s
-            kubectl rollout status deployment/cinebook-frontend -n $Namespace --timeout=180s
+            if ($ImagesChanged) {
+              Write-Host "Restoring previous application images..." -ForegroundColor Yellow
 
-            throw
+              kubectl set image deployment/cinebook-backend `
+                "backend=$OldBackend" -n $Namespace
+
+              $BackendRollbackExitCode = $LASTEXITCODE
+
+              kubectl set image deployment/cinebook-frontend `
+                "frontend=$OldFrontend" -n $Namespace
+
+              $FrontendRollbackExitCode = $LASTEXITCODE
+
+              if ($BackendRollbackExitCode -ne 0 -or $FrontendRollbackExitCode -ne 0) {
+                Write-Error "One or more application image rollback commands failed."
+              }
+              else {
+                kubectl rollout status deployment/cinebook-backend `
+                  -n $Namespace --timeout=180s
+
+                $BackendRolloutExitCode = $LASTEXITCODE
+
+                kubectl rollout status deployment/cinebook-frontend `
+                  -n $Namespace --timeout=180s
+
+                $FrontendRolloutExitCode = $LASTEXITCODE
+
+                if ($BackendRolloutExitCode -ne 0 -or $FrontendRolloutExitCode -ne 0) {
+                  Write-Error "Application image rollback was requested, but rollout verification failed."
+                }
+                else {
+                  Write-Host "Previous application images restored successfully." -ForegroundColor Green
+                }
+              }
+            }
+            else {
+              Write-Host "Application images were not changed; no image rollback required."
+            }
+
+            throw $DeploymentError
           }
