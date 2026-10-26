@@ -1,4 +1,4 @@
-﻿from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer
 from jwt.exceptions import InvalidTokenError
 from sqlalchemy import select
@@ -63,6 +63,7 @@ def register_user(
     user = User(
         full_name=request.full_name.strip(),
         email=email,
+        phone=request.phone,
         hashed_password=hash_password(request.password),
         role="customer",
         is_active=True,

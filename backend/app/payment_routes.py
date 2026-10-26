@@ -1,3 +1,8 @@
+import hashlib
+import logging
+import secrets
+import time
+from threading import Lock
 from datetime import datetime, timedelta, timezone
 from secrets import token_urlsafe
 from uuid import uuid4
@@ -14,13 +19,15 @@ from app.database import get_db
 from app.event_publisher import publish_event
 from app.user_models import User
 
-router = APIRouter(prefix="/api/payments", tags=["Sandbox Payments"])
+router = APIRouter(prefix="/api/payments", tags=["Payments"])
 PAYMENT_TIMEOUT_MINUTES = 10
 
 
 class SandboxPaymentRequest(BaseModel):
     booking_id: int = Field(gt=0)
-    outcome: str = Field(pattern="^(success|failure)$")
+    payment_method: str = Field(pattern="^(card|upi)$")
+    instrument: str = Field(min_length=1, max_length=100)
+    otp: str = Field(pattern=r"^\d{6}$")
 
 
 class PaymentResponse(BaseModel):
@@ -47,71 +54,27 @@ def _payment_response(payment: Payment) -> dict:
     }
 
 
-def _return_existing_payment(
-    payment: Payment,
-    booking_id: int,
-    expected_status: str,
-    current_user: User,
-    db: Session,
-) -> dict:
-    existing_booking = db.get(Booking, payment.booking_id)
-    if existing_booking is None or existing_booking.user_id != current_user.id:
-        raise HTTPException(status_code=404, detail="Booking not found")
-    if payment.booking_id != booking_id or payment.status != expected_status:
-        raise HTTPException(
-            status_code=409,
-            detail="Idempotency key was already used for a different booking or outcome",
-        )
-    return _payment_response(payment)
-
-
-@router.post("/sandbox", response_model=PaymentResponse)
-def simulate_payment(
-    request: SandboxPaymentRequest,
-    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key", max_length=100),
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
-    if current_user.role != "customer":
-        raise HTTPException(status_code=403, detail="Only customers can make payments")
-
-    expected_status = "succeeded" if request.outcome == "success" else "failed"
-    # Deterministic fallback keeps existing frontend clients replay-safe; new clients may send the header.
-    effective_key = (idempotency_key or f"cinebook-booking-{request.booking_id}-{request.outcome}").strip()
-    if not effective_key or len(effective_key) > 100:
-        raise HTTPException(status_code=400, detail="Invalid Idempotency-Key")
-
-    existing = db.scalar(select(Payment).where(Payment.idempotency_key == effective_key))
-    if existing is not None:
-        return _return_existing_payment(existing, request.booking_id, expected_status, current_user, db)
-
+def _owned_booking(db: Session, booking_id: int, user: User) -> Booking:
     booking = db.scalar(
-        select(Booking).where(Booking.id == request.booking_id).with_for_update()
+        select(Booking).where(Booking.id == booking_id).with_for_update()
     )
-    if booking is None or booking.user_id != current_user.id:
+    if booking is None or booking.user_id != user.id:
         raise HTTPException(status_code=404, detail="Booking not found")
+    return booking
 
-    # A concurrent request may have committed this key while we waited for the booking lock.
-    existing = db.scalar(select(Payment).where(Payment.idempotency_key == effective_key))
-    if existing is not None:
-        return _return_existing_payment(existing, request.booking_id, expected_status, current_user, db)
 
-    if booking.status != "pending_payment":
-        raise HTTPException(status_code=409, detail="Booking is not awaiting payment")
-
+def _check_booking_payable(db: Session, booking: Booking) -> Showtime:
     now = datetime.now(timezone.utc)
-    cutoff = now - timedelta(minutes=PAYMENT_TIMEOUT_MINUTES)
     booked_at = booking.booked_at
     if booked_at.tzinfo is None:
         booked_at = booked_at.replace(tzinfo=timezone.utc)
-    if booked_at <= cutoff:
+    if booked_at <= now - timedelta(minutes=PAYMENT_TIMEOUT_MINUTES):
         booking.status = "cancelled"
         db.commit()
         raise HTTPException(
             status_code=409,
             detail="Payment window expired; booking was cancelled. Please select the seat again.",
         )
-
     showtime = db.get(Showtime, booking.showtime_id)
     if showtime is None:
         raise HTTPException(status_code=404, detail="Showtime not found")
@@ -121,36 +84,14 @@ def simulate_payment(
     if starts_at <= now:
         booking.status = "cancelled"
         db.commit()
-        raise HTTPException(status_code=400, detail="Showtime has started; pending booking was cancelled")
+        raise HTTPException(
+            status_code=400,
+            detail="Showtime has started; pending booking was cancelled",
+        )
+    return showtime
 
-    payment = Payment(
-        booking_id=booking.id,
-        amount_paise=showtime.ticket_price_paise,
-        currency="INR",
-        provider="sandbox",
-        status=expected_status,
-        reference=f"CB-SBX-{uuid4().hex}",
-        idempotency_key=effective_key,
-    )
-    if request.outcome == "success":
-        booking.status = "confirmed"
-        db.add(Ticket(booking_id=booking.id, token=token_urlsafe(32)))
-    else:
-        booking.status = "cancelled"
 
-    db.add(payment)
-    try:
-        db.commit()
-        db.refresh(payment)
-    except IntegrityError:
-        db.rollback()
-        # A simultaneous request using the same key may have won the unique-index race.
-        existing = db.scalar(select(Payment).where(Payment.idempotency_key == effective_key))
-        if existing is not None:
-            return _return_existing_payment(existing, request.booking_id, expected_status, current_user, db)
-        raise HTTPException(status_code=409, detail="Payment could not be recorded; check booking status")
-
-    # Publish only after the transaction committed; replayed requests do not publish duplicates.
+def _publish_payment_event(payment: Payment) -> None:
     try:
         publish_event(
             "payment.succeeded" if payment.status == "succeeded" else "payment.failed",
@@ -163,9 +104,153 @@ def simulate_payment(
             },
         )
     except Exception:
-        # The committed payment/ticket remain authoritative even if the optional event broker is unavailable.
+        # The committed database transaction remains authoritative if RabbitMQ is unavailable.
         pass
 
+
+
+# CINEBOOK_RANDOM_OTP_PATCH
+# Local sandbox only: OTPs are logged to backend logs, never returned to the browser.
+_otp_lock = Lock()
+_otp_challenges = {}
+_otp_ttl_seconds = 300
+_otp_max_attempts = 5
+_otp_logger = logging.getLogger(__name__)
+
+
+class SandboxOtpRequest(BaseModel):
+    booking_id: int = Field(gt=0)
+
+
+def _otp_digest(user_id, booking_id, code):
+    raw = f"{user_id}:{booking_id}:{code}".encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _issue_sandbox_otp(user_id, booking_id):
+    code = f"{secrets.randbelow(1_000_000):06d}"
+    now = time.monotonic()
+    with _otp_lock:
+        _otp_challenges[(str(user_id), int(booking_id))] = {
+            "digest": _otp_digest(user_id, booking_id, code),
+            "expires": now + _otp_ttl_seconds,
+            "attempts": 0,
+        }
+    _otp_logger.warning(
+        "CINEBOOK SANDBOX OTP | user=%s booking=%s code=%s | expires in 5 minutes",
+        user_id, booking_id, code
+    )
+
+
+def _verify_sandbox_otp(user_id, booking_id, code):
+    key = (str(user_id), int(booking_id))
+    now = time.monotonic()
+    with _otp_lock:
+        challenge = _otp_challenges.get(key)
+        if challenge is None or now >= challenge["expires"]:
+            _otp_challenges.pop(key, None)
+            return False
+        if challenge["attempts"] >= _otp_max_attempts:
+            _otp_challenges.pop(key, None)
+            return False
+        challenge["attempts"] += 1
+        candidate = _otp_digest(user_id, booking_id, code)
+        return secrets.compare_digest(candidate, challenge["digest"])
+
+
+@router.post("/otp/request")
+def request_sandbox_otp(
+    request: SandboxOtpRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    if current_user.role != "customer":
+        raise HTTPException(status_code=403, detail="Customer account required")
+
+    booking = _owned_booking(db, request.booking_id, current_user)
+    if booking.status != "pending_payment":
+        raise HTTPException(status_code=409, detail="Booking is not awaiting payment")
+
+    _issue_sandbox_otp(current_user.id, booking.id)
+    return {"message": "A sandbox OTP was generated. Check the local backend logs."}
+
+
+@router.post("/sandbox", response_model=PaymentResponse)
+def simulate_payment(
+    request: SandboxPaymentRequest,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key", max_length=100),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    if current_user.role != "customer":
+        raise HTTPException(status_code=403, detail="Only customers can make payments")
+
+    if not _verify_sandbox_otp(current_user.id, request.booking_id, request.otp):
+        raise HTTPException(status_code=400, detail="Invalid or expired OTP. Request a new code and try again.")
+
+    # Deterministic demo gateway rules; never contacts a bank or card network.
+    instrument = request.instrument.strip().lower()
+    if request.payment_method == "card":
+        if not instrument.isdigit() or len(instrument) != 4:
+            raise HTTPException(status_code=400, detail="Enter a valid demo card number")
+        approved = instrument != "0000" and secrets.randbelow(100) < 80
+    else:
+        if "@" not in instrument:
+            raise HTTPException(status_code=400, detail="Enter a valid demo UPI ID")
+        approved = "fail" not in instrument and secrets.randbelow(100) < 80
+    expected_status = "succeeded" if approved else "failed"
+    effective_key = (idempotency_key or f"cinebook-booking-{request.booking_id}-{request.payment_method}-{instrument}").strip()
+    if not effective_key or len(effective_key) > 100:
+        raise HTTPException(status_code=400, detail="Invalid Idempotency-Key")
+
+    existing = db.scalar(select(Payment).where(Payment.idempotency_key == effective_key))
+    if existing is not None:
+        existing_booking = db.get(Booking, existing.booking_id)
+        if existing_booking is None or existing_booking.user_id != current_user.id:
+            raise HTTPException(status_code=404, detail="Booking not found")
+        if existing.booking_id != request.booking_id or existing.status != expected_status:
+            raise HTTPException(status_code=409, detail="Idempotency key was already used differently")
+        return _payment_response(existing)
+
+    booking = _owned_booking(db, request.booking_id, current_user)
+    existing = db.scalar(select(Payment).where(Payment.idempotency_key == effective_key))
+    if existing is not None:
+        if existing.booking_id != request.booking_id or existing.status != expected_status:
+            raise HTTPException(status_code=409, detail="Idempotency key was already used differently")
+        return _payment_response(existing)
+
+    if booking.status != "pending_payment":
+        raise HTTPException(status_code=409, detail="Booking is not awaiting payment")
+    showtime = _check_booking_payable(db, booking)
+
+    payment = Payment(
+        booking_id=booking.id,
+        amount_paise=showtime.ticket_price_paise,
+        currency="INR",
+        provider="sandbox",
+        status=expected_status,
+        reference=f"CB-SBX-{uuid4().hex}",
+        idempotency_key=effective_key,
+    )
+    if approved:
+        booking.status = "confirmed"
+        if db.scalar(select(Ticket).where(Ticket.booking_id == booking.id)) is None:
+            db.add(Ticket(booking_id=booking.id, token=token_urlsafe(32)))
+    else:
+        booking.status = "cancelled"
+
+    db.add(payment)
+    try:
+        db.commit()
+        db.refresh(payment)
+    except IntegrityError:
+        db.rollback()
+        existing = db.scalar(select(Payment).where(Payment.idempotency_key == effective_key))
+        if existing is not None and existing.booking_id == request.booking_id and existing.status == expected_status:
+            return _payment_response(existing)
+        raise HTTPException(status_code=409, detail="Payment could not be recorded; check booking status")
+
+    _publish_payment_event(payment)
     return _payment_response(payment)
 
 
