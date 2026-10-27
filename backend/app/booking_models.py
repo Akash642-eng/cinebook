@@ -131,7 +131,7 @@ class Payment(Base):
         ),
         CheckConstraint(
             "provider = 'sandbox'",
-            name="ck_payment_provider_sandbox",
+            name="ck_payment_provider_valid",
         ),
     )
 

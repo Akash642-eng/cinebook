@@ -1,4 +1,4 @@
-﻿
+
 name: Deploy CineBook to Minikube
 
 on:
@@ -109,6 +109,27 @@ jobs:
               throw "Database migration failed. Application images were not updated."
             }
 
+            Write-Host "Applying user phone migration..."
+
+            $PhoneMigrationPath = Join-Path $env:GITHUB_WORKSPACE "backend/migrations/day7_user_phone.sql"
+            if (-not (Test-Path -LiteralPath $PhoneMigrationPath -PathType Leaf)) {
+              throw "Phone migration file not found: $PhoneMigrationPath"
+            }
+
+            $PhoneMigrationSql = Get-Content -LiteralPath $PhoneMigrationPath -Raw
+            if ([string]::IsNullOrWhiteSpace($PhoneMigrationSql)) {
+              throw "Phone migration file is empty."
+            }
+
+            $PhoneMigrationSql |
+              kubectl exec -i -n $Namespace deployment/cinebook-postgres -- `
+                psql -v ON_ERROR_STOP=1 -U cinebook -d cinebook
+
+            if ($LASTEXITCODE -ne 0) {
+              throw "Phone migration failed. Application images were not updated."
+            }
+
+            Write-Host "Phone migration completed successfully."
             Write-Host "Database migration completed successfully."
 
             # Deploy the backend image.
